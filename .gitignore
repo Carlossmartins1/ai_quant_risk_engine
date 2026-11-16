@@ -7,6 +7,7 @@ env/
 .env
 .env.*
 !.env.example
+Claves.txt
 
 # Python
 __pycache__/
