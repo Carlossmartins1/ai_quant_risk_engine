@@ -11,7 +11,8 @@ Paneles
 * **Cuentas**: health ratio en tiempo real de cada cuenta (misma fórmula que el motor de riesgo).
 * **Liquidaciones**: histórico con déficit, slippage y régimen de mercado.
 * **Mercado**: mark / oracle / basis / liquidez publicados por el orquestador.
-* **Control**: Modo Normal ↔ Cisne Negro vía la cola ``simulation_commands`` (plano de control en PostgreSQL).
+* **Control**: Modo Normal ↔ Cisne Negro y recapitalización de agentes vía la cola ``simulation_commands``
+  (plano de control en PostgreSQL).
 
 Ejecución::
 
@@ -89,12 +90,20 @@ def operator_authorized() -> bool:
     return False
 
 
+COMMAND_LABELS = {
+    SimulationCommand.SET_NORMAL: ("volver a Modo Normal", "🟢"),
+    SimulationCommand.TRIGGER_BLACK_SWAN: ("Cisne Negro disparado", "🦢"),
+    SimulationCommand.RESET_AGENTS: ("agentes recapitalizados", "♻️"),
+}
+
+
 def _send_command(repo: DashboardRepository, command: SimulationCommand, operator: str) -> None:
     """Callback de botón: se ejecuta ANTES del rerun, por lo que puede resetear widgets (confirmación)."""
     cid = repo.request(command, operator)
-    label = "Cisne Negro disparado" if command is SimulationCommand.TRIGGER_BLACK_SWAN else "volver a Modo Normal"
-    st.session_state["last_command_msg"] = f"Comando #{cid}: {label}"
+    label, icon = COMMAND_LABELS[command]
+    st.session_state["last_command_msg"] = (f"Comando #{cid}: {label}", icon)
     st.session_state["confirm_bs"] = False
+    st.session_state["confirm_reset"] = False
 
 
 # -----------------------------------------------------------------------------
@@ -128,8 +137,16 @@ def render_control_panel(repo: DashboardRepository) -> None:
     st.button("🦢 Disparar Cisne Negro", key="btn_black_swan", type="primary", width="stretch",
               disabled=not authorized or not confirm or state.current_mode == "BLACK_SWAN",
               on_click=_send_command, args=(repo, SimulationCommand.TRIGGER_BLACK_SWAN, operator))
+
+    st.subheader("Agentes")
+    st.caption("Cierra sus posiciones y les devuelve el colateral inicial. El Insurance Fund no cambia.")
+    confirm_reset = st.checkbox("Confirmo reiniciar las cuentas", key="confirm_reset", disabled=not authorized)
+    st.button("♻️ Recapitalizar agentes", key="btn_reset_agents", width="stretch",
+              disabled=not authorized or not confirm_reset,
+              on_click=_send_command, args=(repo, SimulationCommand.RESET_AGENTS, operator))
     if msg := st.session_state.pop("last_command_msg", None):
-        st.toast(msg, icon="🦢" if "Cisne" in msg else "🟢")
+        text, icon = msg
+        st.toast(text, icon=icon)
 
     with st.expander("Últimos comandos"):
         cmds = repo.recent_commands()

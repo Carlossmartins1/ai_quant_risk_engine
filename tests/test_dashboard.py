@@ -84,6 +84,35 @@ def test_orchestrator_consumes_dashboard_command(clean_db):
     assert row["current_mode"] == "OFFLINE" and set(row["market_state"]) == {"BTC", "ETH"}
 
 
+def test_reset_agents_command_recapitalizes_accounts(clean_db):
+    seed_insurance_fund(clean_db, 50_000)
+    agents = [TradingAgent(AgentPersona.whale(directional_bias="LONG")), TradingAgent(AgentPersona.arbitrageur())]
+    orch = Orchestrator(clean_db, config=OrchestratorConfig(seed=4), agents=agents)
+    ids = orch.bootstrap()
+    whale, arb = ids["whale_trader"], ids["arbitrageur"]
+    with clean_db.transaction() as cur:  # whale liquidado y arbitrajista con posición abierta y PnL acumulado
+        cur.execute("UPDATE users_collateral SET deposited_collateral = 0, account_status = 'LIQUIDATED' "
+                    "WHERE user_id = %s", (whale,))
+        cur.execute("UPDATE users_collateral SET deposited_collateral = 76000 WHERE user_id = %s", (arb,))
+        cur.execute("""INSERT INTO open_positions (user_id, symbol, quantity, entry_price, leverage, maintenance_margin_rate)
+                       VALUES (%s, 'BTC', 0.5, 95000, 3, 0.025)""", (arb,))
+    orch._liquidated_at[whale] = 1.0
+
+    ControlPlane(clean_db).enqueue(SimulationCommand.RESET_AGENTS, requested_by="risk-operator")
+    orch._control_tick()
+
+    with clean_db.transaction(readonly=True) as cur:
+        cur.execute("SELECT agent_name, account_status::text AS s, deposited_collateral::float AS c "
+                    "FROM users_collateral ORDER BY user_id")
+        accounts = {r["agent_name"]: (r["s"], r["c"]) for r in cur.fetchall()}
+        cur.execute("SELECT count(*) AS n FROM open_positions WHERE status = 'OPEN'")
+        open_positions = cur.fetchone()["n"]
+        cur.execute("SELECT balance::float AS b FROM insurance_fund")
+        fund = cur.fetchone()["b"]
+    assert accounts == {"whale_trader": ("ACTIVE", 10_000.0), "arbitrageur": ("ACTIVE", 100_000.0)}
+    assert open_positions == 0 and fund == 50_000.0 and not orch._liquidated_at
+
+
 # ============================================================================= capa de datos
 def test_repository_views(clean_db):
     uid = _liquidate_whale(clean_db)
@@ -167,6 +196,15 @@ def test_streamlit_app_renders_and_triggers_black_swan(app_env):
         rows = cur.fetchall()
     assert [(r["c"], r["requested_by"]) for r in rows] == [("TRIGGER_BLACK_SWAN", "dashboard")]
     assert at.checkbox(key="confirm_bs").value is False             # la confirmación se rearma
+
+    assert next(b for b in at.button if b.key == "btn_reset_agents").disabled
+    at.checkbox(key="confirm_reset").check().run()
+    next(b for b in at.button if b.key == "btn_reset_agents").click().run()
+    assert not at.exception
+    with app_env.transaction(readonly=True) as cur:
+        cur.execute("SELECT command::text AS c FROM simulation_commands ORDER BY command_id")
+        assert [r["c"] for r in cur.fetchall()] == ["TRIGGER_BLACK_SWAN", "RESET_AGENTS"]
+    assert at.checkbox(key="confirm_reset").value is False
 
 
 def test_streamlit_controls_require_operator_password(app_env, monkeypatch):

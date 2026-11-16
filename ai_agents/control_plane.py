@@ -36,6 +36,7 @@ log = structlog.get_logger(__name__)
 class SimulationCommand(str, Enum):  # = ENUM simulation_command
     SET_NORMAL = "SET_NORMAL"
     TRIGGER_BLACK_SWAN = "TRIGGER_BLACK_SWAN"
+    RESET_AGENTS = "RESET_AGENTS"
 
 
 @dataclass(frozen=True)

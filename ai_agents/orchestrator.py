@@ -57,7 +57,7 @@ from ai_agents.trader_agents import (
     TradingAgent,
     default_agents,
 )
-from database.connection import DatabaseManager
+from database.connection import DatabaseManager, lock_account
 from quant_models.monte_carlo import ScenarioConfig
 from risk_engine.liquidation_executor import (
     LiquidationConfig,
@@ -199,12 +199,31 @@ class Orchestrator:
                 uid = cur.fetchone()["user_id"]
                 self._user_ids[p.name] = uid
                 if self.cfg.reset_accounts:
-                    cur.execute("""UPDATE open_positions SET status = 'CLOSED', closed_at = now()
-                                    WHERE user_id = %s AND status = 'OPEN'""", (uid,))
-                    cur.execute("""UPDATE users_collateral SET deposited_collateral = %s, account_status = 'ACTIVE'
-                                    WHERE user_id = %s""", (p.initial_collateral, uid))
+                    self._reset_account(cur, uid, p.initial_collateral)
         log.info("orchestrator.bootstrap", accounts=self._user_ids)
         return dict(self._user_ids)
+
+    def reset_agents(self) -> None:
+        """
+        Recapitaliza a todos los agentes en caliente (comando ``RESET_AGENTS`` del dashboard): cierra sus
+        posiciones y les devuelve el colateral inicial con la cuenta ACTIVE. El Insurance Fund no se toca.
+        Bloquea las cuentas en orden de ``user_id`` (orden canónico) para no interbloquearse con el
+        liquidador ni con el gateway.
+        """
+        with self.db.transaction() as cur:
+            for agent in sorted(self.agents, key=lambda a: self._user_ids[a.name]):
+                uid = self._user_ids[agent.name]
+                lock_account(cur, uid)
+                self._reset_account(cur, uid, agent.persona.initial_collateral)
+        self._liquidated_at.clear()
+        log.warning("orchestrator.agents_reset", accounts=self._user_ids)
+
+    @staticmethod
+    def _reset_account(cur: Any, uid: int, collateral: float) -> None:
+        cur.execute("""UPDATE open_positions SET status = 'CLOSED', closed_at = now()
+                        WHERE user_id = %s AND status = 'OPEN'""", (uid,))
+        cur.execute("""UPDATE users_collateral SET deposited_collateral = %s, account_status = 'ACTIVE'
+                        WHERE user_id = %s""", (collateral, uid))
 
     # ------------------------------------------------------------------- run
     def run(self, duration_s: float = math.inf) -> SimulationReport:
@@ -321,6 +340,8 @@ class Orchestrator:
                 self.trigger_black_swan()
             elif cmd is SimulationCommand.SET_NORMAL:
                 self.set_mode(MarketMode.NORMAL)
+            elif cmd is SimulationCommand.RESET_AGENTS:
+                self.reset_agents()
         with self._rec_lock:
             n_liq = len(self._outcomes)
             deficit = float(sum(o.deficit for _, o, _ in self._outcomes))
