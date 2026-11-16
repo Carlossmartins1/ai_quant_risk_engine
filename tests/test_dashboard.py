@@ -136,7 +136,8 @@ def app_env(clean_db, monkeypatch):
     for k, v in {"POSTGRES_HOST": kw["host"], "POSTGRES_PORT": str(kw["port"]), "POSTGRES_USER": kw["user"],
                  "POSTGRES_PASSWORD": kw["password"], "POSTGRES_DB": TEST_DB}.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.delenv("DASHBOARD_ADMIN_PASSWORD", raising=False)
+    # Vacía (no borrada): DBConfig.from_env() carga .env sin override y la reintroduciría
+    monkeypatch.setenv("DASHBOARD_ADMIN_PASSWORD", "")
     import streamlit as st
 
     st.cache_resource.clear()
