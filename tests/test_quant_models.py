@@ -325,6 +325,25 @@ def test_margin_stress_gap_risk_analytic():
     assert res.margin_stress(safe).liquidation_probability == 0.0
 
 
+def test_gradual_crash_liquidates_before_bankruptcy():
+    """Mismo −18 % repartido en 18 pasos: total idéntico, pero la liquidación llega antes de la quiebra."""
+    dyn = CrisisDynamics(liquidity_drain_per_event=0.5, base_spread_bps=3.0)
+    base = dict(assets=(AssetParams("BTC", 95_000, sigma=0.0, crash_pct=0.18), AssetParams("ETH", 3_500, sigma=0.0)),
+                crash_time_days=0.25, dynamics=dyn)
+    res = JumpDiffusionSimulator(_flat(crash_steps=18, **base)).run()
+    btc = res.paths("BTC")[0]
+    steps = btc[1:] / btc[:-1] - 1
+    np.testing.assert_allclose(steps[12:30], 0.82 ** (1 / 18) - 1)
+    assert np.all(steps[:12] == 0) and np.all(steps[30:] == 0)
+    assert btc[-1] == pytest.approx(95_000 * 0.82)
+
+    whale = MarginAccount("whale", 4_750, {"BTC": 1.0}, {"BTC": 95_000})
+    assert res.margin_stress(whale).bad_debt_probability == 0.0
+    assert JumpDiffusionSimulator(_flat(crash_steps=1, **base)).run().margin_stress(whale).bad_debt_probability == 1.0
+    with pytest.raises(ValueError):
+        _flat(crash_steps=0, **base)
+
+
 def test_black_swan_separates_agent_profiles_and_mc_var():
     res = JumpDiffusionSimulator(ScenarioConfig.black_swan(n_paths=5_000, seed=21)).run()
     agents = [

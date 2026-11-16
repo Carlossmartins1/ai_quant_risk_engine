@@ -85,6 +85,7 @@ class OrchestratorConfig:
     stress_paths: int = 2_000
     stress_path_quantile: float = 0.05     # trayectoria del percentil 5 de BTC (escenario de cola)
     stress_vol_multiplier: float = 1.0
+    stress_crash_steps: int = 18           # ticks del shock forzado (18 => BTC ≈ −1.1 %/tick; 1 = gap instantáneo)
     normal_paths: int = 256
     seed: int | None = None
     initial_prices: Mapping[str, float] = field(default_factory=lambda: {"BTC": 95_000.0, "ETH": 3_500.0})
@@ -293,7 +294,8 @@ class Orchestrator:
     def _switch_mode(self, mode: MarketMode) -> None:
         prices = self._current_prices()
         if mode is MarketMode.BLACK_SWAN:
-            cfg = ScenarioConfig.black_swan(n_paths=self.cfg.stress_paths, seed=self._next_seed()).with_prices(prices)
+            cfg = ScenarioConfig.black_swan(n_paths=self.cfg.stress_paths, seed=self._next_seed(),
+                                            crash_steps=self.cfg.stress_crash_steps).with_prices(prices)
             if self.stress_annual_vols:
                 cfg = cfg.with_volatility(self.stress_annual_vols, multiplier=self.cfg.stress_vol_multiplier)
             self._source = MonteCarloPathSource.from_config(cfg, quantile=self.cfg.stress_path_quantile)
@@ -508,6 +510,8 @@ def main() -> None:  # pragma: no cover - punto de entrada interactivo
                         help="segundo en que se dispara el cisne negro (por defecto: solo desde el dashboard)")
     parser.add_argument("--tick", type=float, default=0.25, help="segundos por paso de 5 min simulado")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--crash-steps", type=int, default=OrchestratorConfig.stress_crash_steps,
+                        help="ticks en los que se reparte el shock del Cisne Negro (1 = gap instantáneo)")
     parser.add_argument("--live", action="store_true", help="precios base en vivo de Hyperliquid Testnet")
     parser.add_argument("--insurance-fund", type=float, default=None, help="capitaliza el fondo antes de empezar")
     parser.add_argument("--csv", type=str, default=None, help="prefijo para exportar timeline/liquidaciones")
@@ -535,7 +539,8 @@ def main() -> None:  # pragma: no cover - punto de entrada interactivo
         if not feed.store.wait_until_ready(timeout=20):
             raise SystemExit("Sin datos del feed de Hyperliquid en 20 s")
 
-    cfg = OrchestratorConfig(tick_interval_s=args.tick, black_swan_after_s=args.black_swan_at, seed=args.seed)
+    cfg = OrchestratorConfig(tick_interval_s=args.tick, black_swan_after_s=args.black_swan_at, seed=args.seed,
+                             stress_crash_steps=args.crash_steps)
     agents = default_agents(whale_bias=args.whale_bias, use_llm=False if args.no_llm else None)
     orch = Orchestrator(db, config=cfg, agents=agents, live_store=feed.store if feed else None)
     for sig in (signal.SIGTERM, signal.SIGINT):  # parada ordenada en `docker stop` / Ctrl-C

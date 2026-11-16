@@ -12,7 +12,7 @@ Dinámica por activo i (log-precio, medida física, tiempo en años)
     d ln S_i = (μ_i − ½ σ_i² v_t²) dt  +  σ_i v_t dW_i          difusión correlacionada (Cholesky)
              + β_i · Σ_k Y_k dN_t                                saltos SISTÉMICOS (contagio BTC↔ETH)
              + Σ_k Y_ik dN_it                                    saltos idiosincráticos
-             + ln(1 − c_i) · 1[t = t_crash]                      shock exógeno forzado (cisne negro)
+             + ln(1 − c_i)/M · 1[t_crash ≤ t < t_crash + M]      shock forzado repartido en M pasos (cisne negro)
 
     Y_k ~ N(μ_J, σ_J²)       tamaño de salto (log)
     λ_t = λ_0 + H_t,  H_t = H_{t−1} e^{−κ dt} + η · eventos_{t−1}    intensidad Hawkes (autoexcitada)
@@ -155,6 +155,7 @@ class ScenarioConfig:
     n_steps: int = 288                     # 5 minutos sobre 24 h
     n_paths: int = 10_000
     crash_time_days: float | None = None   # instante del shock forzado (None = sin shock)
+    crash_steps: int = 1                   # pasos en los que se reparte el shock (1 = gap instantáneo)
     compensate_jumps: bool = False         # True => E[S_T] neutral al salto (martingala); False => sesgo bajista
     antithetic: bool = True                # variables antitéticas en la difusión (reduce varianza)
     seed: int | None = None
@@ -171,6 +172,8 @@ class ScenarioConfig:
             raise ValueError("n_steps >= 1, n_paths >= 2, horizon_days > 0")
         if self.crash_time_days is not None and not 0 <= self.crash_time_days < self.horizon_days:
             raise ValueError("crash_time_days debe estar dentro del horizonte")
+        if self.crash_steps < 1:
+            raise ValueError("crash_steps >= 1")
         object.__setattr__(self, "correlation", corr)
 
     @property
@@ -206,7 +209,8 @@ class ScenarioConfig:
         Cisne negro (parámetros ilustrativos, del orden de magnitud de episodios como marzo 2020
         o mayo 2021): shock forzado a la hora 1 (BTC −18 %, ETH −24 %), cascada Hawkes de saltos
         bajistas (ramificación 0.75, memoria ~1 h), vol de difusión ×1.6 (hasta ×3 tras clusters de
-        saltos), correlación 0.95 y drenaje severo de liquidez.
+        saltos), correlación 0.95 y drenaje severo de liquidez. ``crash_steps`` > 1 reparte el shock
+        en caída geométrica uniforme (p.ej. 18 pasos => BTC ≈ −1.1 % por paso).
         """
         base = cls(
             name="black_swan",
@@ -529,7 +533,8 @@ class JumpDiffusionSimulator:
                 idio = rng.poisson(a.idio_jump_intensity * dt, size=(P, T)).astype(np.int32)
                 increments[:, :, i] += self._compound_normal(rng, idio, a.idio_jump_mean, a.idio_jump_std)
             if crash_step is not None and a.crash_pct > 0:
-                increments[:, crash_step, i] += math.log1p(-a.crash_pct)
+                end = min(T, crash_step + cfg.crash_steps)  # truncado al horizonte: la caída total se conserva
+                increments[:, crash_step:end, i] += math.log1p(-a.crash_pct) / (end - crash_step)
         if cfg.compensate_jumps and cfg.jumps.intensity > 0:
             # E[e^{βY}] − 1 por salto; compensa la intensidad base (aprox. de primer orden con Hawkes)
             k = np.exp(beta * cfg.jumps.mean + 0.5 * (beta * cfg.jumps.std) ** 2) - 1

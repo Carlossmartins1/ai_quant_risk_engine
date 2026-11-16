@@ -255,7 +255,7 @@ def test_orchestrator_black_swan_cascade_hits_insurance_fund(clean_db):
     agents = [TradingAgent(AgentPersona.whale(directional_bias="LONG")), TradingAgent(AgentPersona.arbitrageur()),
               TradingAgent(AgentPersona.manipulator())]
     cfg = OrchestratorConfig(tick_interval_s=0.05, risk_interval_s=0.05, decision_interval_s=0.4,
-                             black_swan_after_s=1.5, stress_paths=300, seed=11)
+                             black_swan_after_s=1.5, stress_paths=300, seed=11, stress_crash_steps=1)  # gap: déficit
     report = Orchestrator(clean_db, config=cfg, agents=agents).run(6.0)
     s = report.summary
     assert [m for _, m in report.mode_changes][:2] == ["NORMAL", "BLACK_SWAN"]
