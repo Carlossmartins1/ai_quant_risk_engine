@@ -1,0 +1,26 @@
+{
+  "Rules": [
+    {
+      "ID": "operational-logs",
+      "Filter": { "Prefix": "risk-engine/prod/logs/" },
+      "Status": "Enabled",
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 90, "StorageClass": "GLACIER_IR" }
+      ],
+      "Expiration": { "Days": 400 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 3 }
+    },
+    {
+      "ID": "audit-trail-liquidations",
+      "Filter": { "Prefix": "risk-engine/prod/audit/" },
+      "Status": "Enabled",
+      "Transitions": [
+        { "Days": 90, "StorageClass": "GLACIER_IR" },
+        { "Days": 365, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "Expiration": { "Days": 2555 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 3 }
+    }
+  ]
+}

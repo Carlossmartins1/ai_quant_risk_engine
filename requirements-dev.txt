@@ -1,0 +1,7 @@
+# Desarrollo y CI: runtime completo + dashboard + herramientas de test
+-r requirements.txt
+-r requirements-dashboard.txt
+pytest>=8.0,<10
+pytest-cov>=5.0,<8
+moto[s3]>=5.0,<6
+pyflakes>=3.2,<4

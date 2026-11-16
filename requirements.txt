@@ -1,0 +1,40 @@
+# =============================================================================
+#  AI-Driven Quant Risk & Liquidation Engine — dependencias (Python 3.10+)
+#  Rangos acotados por versión mayor: reproducible sin congelar parches de seguridad.
+#  Runtime del motor/orquestador (imagen "engine"). Para despliegue reproducible:
+#  pip install -r requirements.txt && pip freeze > requirements.lock
+# =============================================================================
+
+# --- Cómputo vectorizado ------------------------------------------------------
+numpy>=1.26,<3
+pandas>=2.2,<4
+
+# --- Modelado cuantitativo y riesgo -------------------------------------------
+scipy>=1.12,<2                  # distribuciones, optimización, Monte Carlo
+statsmodels>=0.14,<1            # series temporales, tests ADF/Ljung-Box
+arch>=7.0,<10                   # GARCH / EGARCH / GJR-GARCH (volatilidad estocástica)
+
+# --- Exchange: Hyperliquid (market data + Testnet) ----------------------------
+hyperliquid-python-sdk>=0.20,<1
+eth-account>=0.13,<1            # firma EIP-712 de órdenes
+websockets>=13,<18              # API asyncio nativa (websockets.asyncio.client)
+
+# --- Agentes autónomos (IA) ----------------------------------------------------
+langchain>=0.3,<2
+langchain-openai>=0.2,<2
+openai>=1.50,<4
+
+# --- Base de datos ------------------------------------------------------------
+psycopg2-binary>=2.9.9,<3       # en EC2 producción: sustituir por psycopg2 (compilado contra libpq del sistema)
+
+# --- Infraestructura AWS -------------------------------------------------------
+boto3>=1.34,<2
+
+# --- Configuración, validación y observabilidad --------------------------------
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
+python-dotenv>=1.0,<2
+structlog>=24.1,<27
+tenacity>=8.2,<10
+
+# Desarrollo y tests: requirements-dev.txt · Dashboard (imagen ligera): requirements-dashboard.txt

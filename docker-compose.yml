@@ -1,0 +1,91 @@
+# =============================================================================
+#  AI-Driven Quant Risk & Liquidation Engine — Infraestructura local (Fase 1)
+#  Uso:
+#     cp .env.example .env        # y define POSTGRES_PASSWORD
+#     docker compose up -d
+#     docker compose ps           # espera a "healthy"
+#     docker compose exec postgres psql -U $POSTGRES_USER -d $POSTGRES_DB
+#
+#  Nota: schema.sql (+ migraciones) se ejecutan SOLO en la primera inicialización del volumen.
+#  Con un volumen ya existente: python -m database.migrate
+#  Para re-aplicarlo desde cero:  docker compose down -v && docker compose up -d
+# =============================================================================
+name: ai-quant-risk-engine
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: risk_engine_db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-risk_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en el fichero .env}
+      POSTGRES_DB: ${POSTGRES_DB:-risk_engine}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: UTC
+      PGTZ: UTC
+      # --data-checksums: detecta corrupción silenciosa de páginas (obligatorio en un ledger financiero)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --data-checksums"
+
+    # Solo loopback: la BD nunca queda expuesta a la red pública del host/EC2.
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      - risk_engine_pgdata:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./database/migrations/002_simulation_control.sql:/docker-entrypoint-initdb.d/02_simulation_control.sql:ro
+
+    # Tuning orientado a un motor OLTP con alta contención de filas (SELECT ... FOR UPDATE)
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - synchronous_commit=on                      # durabilidad estricta: COMMIT = persistido en WAL
+      - -c
+      - wal_level=replica                          # habilita réplicas / PITR en AWS
+      - -c
+      - deadlock_timeout=200ms                     # detección rápida de interbloqueos
+      - -c
+      - log_lock_waits=on                          # loguea esperas de lock > deadlock_timeout
+      - -c
+      - log_min_duration_statement=250             # queries lentas (ms)
+      - -c
+      - idle_in_transaction_session_timeout=30s    # mata transacciones zombis que retienen locks
+      - -c
+      - timezone=UTC
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - risk_net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  risk_engine_pgdata:
+    name: risk_engine_pgdata
+
+networks:
+  risk_net:
+    name: risk_net
+    driver: bridge
