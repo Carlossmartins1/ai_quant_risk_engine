@@ -27,7 +27,7 @@ from database.connection import DatabaseManager
 from risk_engine.margin_calculator import compute_margins, load_risk_inputs
 
 __all__ = ["FundOverview", "AccountsHealth", "RiskOverview", "DashboardRepository", "MarketTape", "health_status",
-           "risk_overview", "feed_view", "open_interest", "liquidation_map", "fmt_usd", "fmt_short"]
+           "risk_overview", "feed_view", "liquidation_map", "fmt_usd", "fmt_short"]
 
 HEALTH_WARNING = 1.2   # alerta temprana: < 20 % de colchón sobre el margen de mantenimiento
 
@@ -93,13 +93,6 @@ class AccountsHealth:
     marks_source: str           # "orchestrator" | "last_mark_price" | "none"
     marks_live: bool
     positions: pd.DataFrame = field(default_factory=pd.DataFrame)
-
-
-def open_interest(health: AccountsHealth) -> float:
-    """Open interest (nocional bruto a mark) de las cuentas monitorizadas."""
-    if health.table.empty:
-        return 0.0
-    return float(health.table["gross_notional"].fillna(0.0).sum())
 
 
 def liquidation_map(health: AccountsHealth, *, band: float = 0.15, bins: int = 60) -> pd.DataFrame:

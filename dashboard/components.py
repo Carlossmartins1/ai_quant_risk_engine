@@ -19,7 +19,7 @@ from dash.dash_table import FormatTemplate
 from dash.dash_table.Format import Format, Scheme, Sign
 
 from ai_agents.control_plane import ControlState
-from dashboard.data import FundOverview, fmt_usd
+from dashboard.data import FundOverview, RiskOverview, fmt_short, fmt_usd
 from dashboard.theme import (
     BG,
     BORDER,
@@ -115,29 +115,37 @@ def ticker_cells(view: pd.DataFrame) -> list[html.Div]:
 def _kpi(label: str, value: str, sub: str = "", *, state: str = "") -> dbc.Col:
     return dbc.Col(html.Div([html.Div(label, className="label"), html.Div(value, className="value"),
                              html.Div(sub, className="sub")], className=f"kpi {state}".strip()),
-                   xs=6, md=4, xl=2, className="mb-3")
+                   xs=6, md=4, xl=True, className="mb-3")
 
 
-def kpi_cards(fund: FundOverview, open_interest: float, risk: dict[str, Any], at_risk: int) -> list[dbc.Col]:
+def kpi_cards(fund: FundOverview, risk: RiskOverview, at_risk: int) -> list[dbc.Col]:
     depleted = fund.balance < 0
-    coverage = fund.balance / open_interest if open_interest > 0 else math.nan
-    var, es = risk.get("var"), risk.get("es")
-    alpha = risk.get("alpha", 0.99)
-    var_sub = f"{risk.get('n_scenarios', 0):,} escenarios · 1 tick" if var is not None else "calentando ventana…"
+    coverage = risk.coverage_ratio
+    alpha = risk.alpha or 0.99
+    horizon = f"{risk.horizon_ticks} ticks" if risk.horizon_ticks else "1 tick"
+    if risk.var is None:
+        var_sub = es_sub = "con el orquestador en marcha"
+    else:
+        var_sub = f"cartera · {horizon} · t-Student/EWMA"
+        es_sub = "cola 1 %" + (f" · fondo {risk.fund_to_es:.2f}× ES" if risk.fund_to_es is not None else "")
     return [
-        _kpi("Insurance Fund", fmt_usd(fund.balance, compact=True),
-             "DÉFICIT · ADL REQUERIDO" if depleted else f"neto {fund.net_pnl:+,.2f} USD",
+        _kpi("Insurance Fund", fmt_short(fund.balance),
+             "DÉFICIT · ADL EN CURSO" if depleted else f"neto {fund.net_pnl:+,.0f} USD",
              state="alert" if depleted else ""),
-        _kpi("Cobertura / OI", fmt_pct(coverage), f"OI {fmt_usd(open_interest, compact=True)}",
-             state="alert" if depleted else "caution" if coverage < 0.05 else ""),
-        _kpi("Déficit absorbido", fmt_usd(fund.deficits_absorbed), f"fees {fmt_usd(fund.fees_collected)}",
+        _kpi("Cobertura IF / OI", fmt_pct(coverage, 2), f"OI {fmt_short(risk.open_interest)}",
+             state="alert" if depleted else "caution" if coverage is not None and coverage < 0.05 else ""),
+        _kpi("Déficit absorbido", fmt_usd(fund.deficits_absorbed, compact=True), f"fees {fmt_usd(fund.fees_collected)}",
              state="caution" if fund.deficits_absorbed > 0 else ""),
-        _kpi(f"VaR {alpha:.0%}", fmt_usd(var, compact=True), var_sub),
-        _kpi(f"ES {alpha:.0%}", fmt_usd(es, compact=True), "expected shortfall · cartera agregada"),
+        _kpi(f"VaR {alpha:.0%}", fmt_short(risk.var), var_sub),
+        _kpi(f"ES {alpha:.0%}", fmt_short(risk.es), es_sub,
+             state="caution" if risk.fund_to_es is not None and risk.fund_to_es < 1 else ""),
         _kpi("Liquidaciones", f"{fund.liquidations:,}",
              f"{at_risk} cuenta(s) en riesgo" if at_risk else
              (f"última {fund.last_liquidation_at:%H:%M:%S}" if fund.last_liquidation_at else "sin eventos"),
              state="caution" if at_risk else ""),
+        _kpi("ADL ejecutados", f"{fund.adl_events:,}",
+             f"+{fmt_short(fund.adl_recovered)} al fondo" if fund.adl_recovered else "pro-rata sobre ganadoras",
+             state="caution" if fund.adl_events else ""),
     ]
 
 
@@ -224,7 +232,9 @@ def col(name: str, cid: str, fmt: Format | None = None) -> dict[str, Any]:
 ACCOUNT_COLUMNS = [
     col("Estado", "state"), col("Agente", "agent_name"), col("Perfil", "agent_profile"), col("Posiciones", "positions"),
     col("Health", "health_ratio", NUM3), col("Equity", "equity", MONEY), col("Margen mant.", "maintenance_margin", MONEY),
-    col("Colchón", "margin_buffer", MONEY), col("Colateral", "collateral", MONEY), col("uPnL", "unrealized_pnl", MONEY),
+    col("Colchón", "margin_buffer", MONEY), col("VaR 99%", "var", MONEY), col("ES 99%", "es", MONEY),
+    col("ES / Equity", "es_to_equity", Format(precision=1, scheme=Scheme.percentage)),
+    col("Colateral", "collateral", MONEY), col("uPnL", "unrealized_pnl", MONEY),
     col("Apalanc.", "effective_leverage", NUM1), col("Nocional bruto", "gross_notional", MONEY),
 ]
 POSITION_COLUMNS = [
@@ -242,10 +252,21 @@ LIQUIDATION_COLUMNS = [
     col("Slippage pond.", "wavg_slippage_bps", NUM1), col("Slippage máx", "max_slippage_bps", NUM1),
     col("Ejecución", "execution_source"),
 ]
+PCT2 = Format(precision=2, scheme=Scheme.percentage)
 ADL_COLUMNS = [
-    col("Fecha (UTC)", "created_at"), col("Agente", "agent_name"), col("Régimen", "regime"),
-    col("Déficit", "deficit", MONEY), col("No cubierto (ADL)", "shortfall", MONEY),
-    col("Fondo tras evento", "balance_after", MONEY), col("Nota", "note"),
+    col("#", "adl_event_id"), col("Fecha (UTC)", "created_at"), col("Estado", "status"),
+    col("Liquidación origen", "liquidated_agent"), col("Régimen", "regime"), col("Déficit", "shortfall", MONEY),
+    col("Recuperado", "recovered", MONEY), col("Residual", "residual_shortfall", MONEY), col("φ", "phi", PCT2),
+    col("Cuentas", "counterparties", Format(precision=0, scheme=Scheme.fixed)),
+    col("Posiciones", "positions", Format(precision=0, scheme=Scheme.fixed)),
+    col("Fondo antes", "fund_balance_before", MONEY), col("Fondo después", "fund_balance_after", MONEY),
+]
+ADL_FILL_COLUMNS = [
+    col("ADL", "adl_event_id"), col("Fecha (UTC)", "created_at"), col("Agente", "agent_name"), col("Activo", "symbol"),
+    col("Cantidad previa", "quantity_before", QTY), col("Cerrada", "quantity_closed", QTY),
+    col("Entrada", "entry_price", MONEY), col("Mark", "mark_price", MONEY),
+    col("uPnL previo", "unrealized_pnl_before", MONEY), col("Transferido al fondo", "haircut", MONEY),
+    col("φ cuenta", "account_phi", PCT2),
 ]
 LEDGER_COLUMNS = [
     col("Fecha (UTC)", "created_at"), col("Tipo", "entry_type"), col("Importe", "amount", MONEY),

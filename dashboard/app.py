@@ -56,9 +56,10 @@ from dashboard.data import (  # noqa: E402
     DashboardRepository,
     MarketTape,
     feed_view,
+    fmt_short,
     fmt_usd,
     liquidation_map,
-    open_interest,
+    risk_overview,
 )
 from dashboard.theme import GRAPH_CONFIG  # noqa: E402
 from database.connection import DatabaseManager, DBConfig  # noqa: E402
@@ -132,16 +133,17 @@ def main_view(repo: DashboardRepository, tape: MarketTape, logo_src: str) -> Mai
     fund = repo.fund_overview()
     health = repo.accounts_health(state)
     at_risk = int(health.table["state"].isin(["Liquidable", "En riesgo"]).sum()) if not health.table.empty else 0
-    risk = ((state.stats or {}).get("risk") or {}) if state.is_online() else {}
+    risk = risk_overview(state, health.table, fund.balance)
     alert = None
     if fund.balance < 0:
-        alert = html.Div(f"⚠ INSURANCE FUND EN DÉFICIT ({fmt_usd(fund.balance)}): el fondo no cubre las "
-                         "bancarrotas — se requiere Auto-Deleveraging (ADL).", className="alert-adl mb-3")
+        alert = html.Div(f"⚠ INSURANCE FUND EN DÉFICIT ({fmt_usd(fund.balance)}): déficit pendiente de socializar. "
+                         "El motor ejecuta ADL pro-rata sobre las posiciones ganadoras en cada ciclo.",
+                         className="alert-adl mb-3")
     return MainView(
         header=ui.header_status(state),
         hl_brand=ui.hyperliquid_brand(state, logo_src),
         tickers=ui.ticker_cells(feed_view(state)),
-        kpis=ui.kpi_cards(fund, open_interest(health), risk, at_risk),
+        kpis=ui.kpi_cards(fund, risk, at_risk),
         fund_figure=figures.fund_figure(repo.fund_ledger()),
         price_figure=figures.price_figure(tape.frame()),
         alert=alert,
@@ -206,12 +208,19 @@ def dispatch_command(repo: DashboardRepository, trigger: str, password: str | No
 def tab_view(repo: DashboardRepository, tape: MarketTape, tab: str) -> dict[str, Any]:
     """Datos de la pestaña activa (las inactivas no consultan la BD)."""
     if tab == "accounts":
-        health = repo.accounts_health()
+        state = repo.control_state()
+        health = repo.accounts_health(state)
+        table = health.table
+        if not table.empty:
+            by = risk_overview(state, table, 0.0).var_by_account
+            table = table.assign(var=table["agent_name"].map(lambda n: (by.get(n) or {}).get("var")),
+                                 es=table["agent_name"].map(lambda n: (by.get(n) or {}).get("es")))
+            table["es_to_equity"] = pd.to_numeric(table["es"], errors="coerce") / table["equity"].where(table["equity"] > 0)
         note = "" if health.marks_live else (
             "Precios no publicados por el orquestador: health factors con el último last_mark_price conocido."
             if health.marks else "Sin precios disponibles.")
         return {"acc-health-graph": figures.health_figure(health.table),
-                "acc-table": ui.records(health.table, ui.ACCOUNT_COLUMNS),
+                "acc-table": ui.records(table, ui.ACCOUNT_COLUMNS),
                 "pos-table": ui.records(health.positions, ui.POSITION_COLUMNS),
                 "acc-note": note}
     if tab == "liqmap":
@@ -242,19 +251,32 @@ def tab_view(repo: DashboardRepository, tape: MarketTape, tab: str) -> dict[str,
                 "liq-slippage-graph": figures.slippage_figure(liq),
                 "liq-table": ui.records(liq, ui.LIQUIDATION_COLUMNS)}
     if tab == "adl":
-        adl = repo.adl_events()
+        adl = repo.adl_history()
         fund = repo.fund_overview()
         if fund.balance < 0:
-            callout = html.Div(f"Fondo en déficit: {fmt_usd(fund.balance)} pendientes de socializar vía ADL "
-                               "entre las contrapartes con PnL positivo.", className="alert-adl")
+            callout = html.Div(f"Fondo en déficit: {fmt_usd(fund.balance)} pendientes de socializar. El ADL recorta "
+                               "pro-rata las posiciones ganadoras (misma fracción φ) en cada ciclo.",
+                               className="alert-adl")
         elif len(adl):
-            callout = html.Div("El fondo se recapitalizó tras entrar en déficit; histórico de eventos abajo.",
-                               className="text-muted-x")
+            callout = html.Div("Déficit socializado: el ADL repuso el Insurance Fund.", className="up mono")
         else:
-            callout = html.Div("Sin eventos ADL: el Insurance Fund ha cubierto todas las bancarrotas.",
+            callout = html.Div("Sin eventos de Auto-Deleveraging: el Insurance Fund ha cubierto todos los déficits.",
                                className="up mono")
+        cov = (repo.control_state().stats or {}).get("stress_coverage") or {}
+        stats = [("Déficit a socializar", fmt_short(float(adl["shortfall"].sum()) if len(adl) else 0.0)),
+                 ("Recuperado", fmt_usd(float(adl["recovered"].sum()) if len(adl) else 0.0)),
+                 ("φ máxima", ui.fmt_pct(float(adl["phi"].max()) if len(adl) else None, 2)),
+                 ("Residual pendiente", fmt_short(float(adl.iloc[0]["residual_shortfall"]) if len(adl) else 0.0))]
+        if cov:
+            ratio = cov.get("ratio")
+            stats.append((f"Estrés pre-flight (salto {cov.get('jump', 0):.0%})",
+                          f"peor déficit {fmt_short(cov.get('worst_deficit'))} · "
+                          + ("cobertura ∞" if ratio is None else f"cobertura {ratio:.2f}×")))
         ledger = repo.fund_ledger().sort_values("entry_id", ascending=False)
-        return {"adl-callout": callout, "adl-table": ui.records(adl, ui.ADL_COLUMNS),
+        return {"adl-callout": callout,
+                "adl-stats": [html.Div([html.Span(k), html.Span(v)], className="kv") for k, v in stats],
+                "adl-graph": figures.adl_figure(adl), "adl-table": ui.records(adl, ui.ADL_COLUMNS),
+                "adl-fills-table": ui.records(repo.adl_fills(), ui.ADL_FILL_COLUMNS),
                 "ledger-table": ui.records(ledger, ui.LEDGER_COLUMNS)}
     if tab == "feed":
         state = repo.control_state()
@@ -274,7 +296,8 @@ TAB_OUTPUTS = {
     "liqmap": [("liqmap-graph", "figure"), ("liqmap-summary", "children")],
     "liquidations": [("liq-stats", "children"), ("liq-deficit-graph", "figure"), ("liq-slippage-graph", "figure"),
                      ("liq-table", "data")],
-    "adl": [("adl-callout", "children"), ("adl-table", "data"), ("ledger-table", "data")],
+    "adl": [("adl-callout", "children"), ("adl-stats", "children"), ("adl-graph", "figure"), ("adl-table", "data"),
+            ("adl-fills-table", "data"), ("ledger-table", "data")],
     "feed": [("feed-table", "data"), ("feed-deviation-graph", "figure"), ("feed-meta", "children")],
 }
 
@@ -364,8 +387,14 @@ def build_layout(app: Dash, refresh_ms: int) -> html.Div:
         ],
         "adl": [
             html.Div(id="adl-callout", className="mb-3"),
-            _panel("Eventos de Auto-Deleveraging (déficits con el fondo en negativo)",
-                   ui.data_table("adl-table", ui.ADL_COLUMNS), class_name="mb-3"),
+            dbc.Row([
+                dbc.Col(_panel("Resumen ADL", html.Div(id="adl-stats")), lg=4, className="mb-3"),
+                dbc.Col(_panel("Déficit por evento: recuperado vs. residual", _graph("adl-graph")), lg=8,
+                        className="mb-3"),
+            ]),
+            _panel("Eventos de Auto-Deleveraging", ui.data_table("adl-table", ui.ADL_COLUMNS), class_name="mb-3"),
+            _panel("Posiciones desapalancadas (quién pagó el ADL)",
+                   ui.data_table("adl-fills-table", ui.ADL_FILL_COLUMNS), class_name="mb-3"),
             _panel("Libro mayor del Insurance Fund", ui.data_table("ledger-table", ui.LEDGER_COLUMNS,
                                                                    style_data_conditional=ui.signed_styles("amount"))),
         ],

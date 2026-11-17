@@ -20,6 +20,7 @@ from dashboard.theme import (
     CARD,
     CRITICAL,
     FONT_MONO,
+    GOOD,
     LEDGER_COLORS,
     LIVE,
     MUTED,
@@ -200,6 +201,25 @@ def liquidation_heatmap(liq_map: pd.DataFrame, *, band: float = 0.15) -> go.Figu
         colorbar=dict(title=dict(text="Nocional", font=dict(color=MUTED, size=10)), tickformat="$.2~s",
                       tickfont=dict(family=FONT_MONO, color=MUTED, size=10), thickness=10, outlinewidth=0)))
     return _base(fig, "liqmap", height=170 * len(symbols) + 80)
+
+
+def adl_figure(adl: pd.DataFrame) -> go.Figure:
+    """Déficit de cada ADL partido en recuperado (contrapartes ganadoras) y residual sin socializar."""
+    if adl.empty:
+        return empty_figure("Sin eventos de Auto-Deleveraging", height=260)
+    d = adl.sort_values("adl_event_id")
+    labels = "#" + d["adl_event_id"].astype(str)
+    custom = np.column_stack([d["phi"] * 100, d["liquidated_agent"].fillna("—"), d["status"]])
+    fig = go.Figure([
+        go.Bar(x=labels, y=d["recovered"], name="Recuperado", marker_color=GOOD, customdata=custom,
+               hovertemplate=("%{x} · %{customdata[2]}<br>Recuperado %{y:$,.2f}<br>φ %{customdata[0]:.2f}%"
+                              "<br>Origen %{customdata[1]}<extra></extra>")),
+        go.Bar(x=labels, y=d["residual_shortfall"], name="Residual", marker_color=CRITICAL,
+               hovertemplate="%{x}<br>Residual %{y:$,.2f}<extra></extra>"),
+    ])
+    fig.update_layout(barmode="stack", hovermode="closest", bargap=0.45)
+    fig.update_yaxes(title="Déficit (USD)", tickformat="$.3~s")
+    return _base(fig, "adl", height=260)
 
 
 def deficit_figure(liq: pd.DataFrame) -> go.Figure:

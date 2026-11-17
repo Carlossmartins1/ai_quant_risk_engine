@@ -95,8 +95,9 @@ def test_orchestrator_consumes_dashboard_command(clean_db):
         stats = cur.fetchone()["stats"]
     assert stats["feed"] == {"configured": False, "connected": False, "symbols": {}}   # sin --live
     risk = stats["risk"]
-    if risk:                                                       # ventana de retornos suficiente
-        assert risk["es"] >= risk["var"] >= 0 and risk["alpha"] == 0.99
+    assert risk["alpha"] == 0.99 and risk["horizon_ticks"] == 12
+    if risk["var"] is not None:                                    # ventana de retornos suficiente
+        assert risk["es"] >= risk["var"] >= 0
 
 
 def test_reset_agents_command_recapitalizes_accounts(clean_db):
@@ -167,6 +168,9 @@ def test_repository_views(clean_db):
 
 
 def test_fmt_usd():
+    from dashboard.data import fmt_short
+
+    assert fmt_short(276_331) == "$276.3k" and fmt_short(-10_427_290) == "-$10.4M" and fmt_short(950) == "$950"
     assert fmt_usd(-1234.5) == "-$1,234.50" and fmt_usd(150_527.3, compact=True) == "$150,527"
     assert fmt_usd(None) == "—" and fmt_usd(math.nan) == "—"
 
@@ -259,7 +263,7 @@ def test_dash_app_renders_and_triggers_commands(app_env):
     _liquidate_whale(app_env)
     ControlPlane(app_env).publish("NORMAL", {"BTC": {"mark": 89_000.0, "oracle": 89_010.0, "basis_bps": -1.1,
                                                      "liquidity": 0.8, "spread_bps": 2.0}},
-                                  {"risk": {"var": 1_234.5, "es": 1_500.0, "alpha": 0.99, "n_scenarios": 200}})
+                                  {"risk": {"var": 1_234.5, "es": 1_500.0, "alpha": 0.99, "horizon_ticks": 12}})
     repo = DashboardRepository(app_env)
     app = create_app(repo)
     client = app.server.test_client()
@@ -271,8 +275,8 @@ def test_dash_app_renders_and_triggers_commands(app_env):
 
     view = main_view(repo, MarketTape(), "/assets/hyperliquid.svg")
     kpis = _dumps(view.kpis)
-    for text in ("Insurance Fund", "Cobertura / OI", "Déficit absorbido", "$1,360.00", "VaR 99%", "$1,234.50",
-                 "ES 99%", "Liquidaciones"):
+    for text in ("Insurance Fund", "Cobertura IF / OI", "Déficit absorbido", "$1,360.00", "VaR 99%", "$1.2k",
+                 "ES 99%", "$1.5k", "12 ticks", "Liquidaciones", "ADL ejecutados"):
         assert text in kpis, text
     assert "BTC-PERP" in _dumps(view.tickers) and "89,000.00" in _dumps(view.tickers)
     assert view.alert is None and view.fund_figure.data                          # fondo positivo: sin ADL
@@ -286,6 +290,68 @@ def test_dash_app_renders_and_triggers_commands(app_env):
     cmds = controls_view(repo, None).commands
     assert [r["label"].split(" ", 1)[1] for r in cmds] == ["Recapitalizar", "Cisne Negro"]
     assert all(r["status"] == "⏳ en cola" for r in cmds)                       # sin orquestador que consuma
+
+
+def test_risk_overview_and_adl_views(clean_db):
+    from dashboard.data import risk_overview
+    from risk_engine.adl import AdlEngine
+
+    seed_insurance_fund(clean_db, 1.0)
+    with clean_db.transaction() as cur:
+        cur.execute("UPDATE insurance_fund SET balance = -5000 WHERE fund_id = 1")
+    seed_account(clean_db, "winner", "WHALE_AGGRESSIVE", 50_000, [("BTC", 1.0, 90_000, 10, 0.0125)])
+    AdlEngine(clean_db, make_store({"BTC": {"mark": 100_000.0}})).run()
+    repo = DashboardRepository(clean_db)
+
+    adl = repo.adl_history()
+    assert len(adl) == 1 and adl.iloc[0]["status"] == "COVERED" and adl.iloc[0]["phi"] == pytest.approx(0.5)
+    fills = repo.adl_fills()
+    assert fills.iloc[0]["agent_name"] == "winner" and fills.iloc[0]["haircut"] == pytest.approx(5_000)
+    fund = repo.fund_overview()
+    assert fund.adl_events == 1 and fund.adl_recovered == pytest.approx(5_000) and fund.balance == pytest.approx(0)
+
+    ControlPlane(clean_db).publish("NORMAL", {"BTC": {"mark": 100_000.0}},
+                                   {"risk": {"var": 4_000.0, "es": 5_000.0, "alpha": 0.99, "horizon_ticks": 12,
+                                             "by_account": {"winner": {"var": 4_000.0, "es": 5_000.0}}}})
+    health = repo.accounts_health()
+    risk = risk_overview(repo.control_state(), health.table, 20_000.0)
+    assert risk.open_interest == pytest.approx(50_000)          # 0.5 BTC tras el ADL × 100 000
+    assert risk.coverage_ratio == pytest.approx(0.4) and risk.fund_to_es == pytest.approx(4.0)
+    offline = ControlState("OFFLINE", None, None, None, {}, {"risk": {"var": 1.0}}, 0)
+    assert risk_overview(offline, health.table, 1.0).var is None   # sin heartbeat no se muestran métricas viejas
+
+
+def test_dash_adl_tab_and_risk_kpis(app_env):
+    from dashboard.app import main_view, tab_view
+    from risk_engine.adl import AdlEngine
+
+    seed_insurance_fund(app_env, 1.0)
+    with app_env.transaction() as cur:
+        cur.execute("UPDATE insurance_fund SET balance = -5000 WHERE fund_id = 1")
+    seed_account(app_env, "winner", "WHALE_AGGRESSIVE", 50_000, [("BTC", 1.0, 90_000, 10, 0.0125)])
+    AdlEngine(app_env, make_store({"BTC": {"mark": 100_000.0}})).run()
+    ControlPlane(app_env).publish("NORMAL", {"BTC": {"mark": 100_000.0, "oracle": 100_000.0}},
+                                  {"risk": {"var": 4_000.0, "es": 5_000.0, "alpha": 0.99, "horizon_ticks": 12,
+                                            "by_account": {"winner": {"var": 4_000.0, "es": 5_000.0}}},
+                                   "stress_coverage": {"jump": 0.3, "worst_deficit": 50_000.0, "ratio": 2.0}})
+    repo, tape = DashboardRepository(app_env), MarketTape()
+
+    view = main_view(repo, tape, "/logo.svg")
+    kpis = _dumps(view.kpis)
+    assert view.alert is None                                       # el ADL repuso el fondo a 0
+    for text in ("ADL ejecutados", "+$5.0k al fondo", "$4.0k", "$5.0k", "0.00%"):   # Cobertura IF / OI = 0 / OI
+        assert text in kpis, text
+
+    adl = tab_view(repo, tape, "adl")
+    stats = _dumps(adl["adl-stats"])
+    assert "50.00%" in stats and "$5,000.00" in stats and "cobertura 2.00×" in stats
+    assert adl["adl-table"][0]["status"] == "COVERED" and adl["adl-graph"].data
+    assert adl["adl-fills-table"][0]["agent_name"] == "winner"
+    assert adl["adl-fills-table"][0]["haircut"] == pytest.approx(5_000)
+    assert "Déficit socializado" in _dumps(adl["adl-callout"])
+    row = tab_view(repo, tape, "accounts")["acc-table"][0]
+    assert row["agent_name"] == "winner" and row["var"] == 4_000.0 and row["es"] == 5_000.0
+    assert row["es_to_equity"] == pytest.approx(5_000 / row["equity"])
 
 
 def test_dash_controls_require_operator_password(app_env, monkeypatch):
@@ -314,10 +380,9 @@ def test_dash_tabs_and_adl_events(app_env):
     ControlPlane(app_env).publish("BLACK_SWAN", {"BTC": {"mark": 85_500.0}, "ETH": {"mark": 3_400.0}})
     repo = DashboardRepository(app_env)
 
-    adl = repo.adl_events()
-    assert len(adl) == 1 and adl.iloc[0]["shortfall"] == pytest.approx(360) and adl.iloc[0]["agent_name"] == "whale"
+    assert repo.fund_overview().balance == pytest.approx(-360) and repo.adl_history().empty
     view = main_view(repo, MarketTape(), "/logo.svg")
-    assert "ADL" in _dumps(view.alert) and "ADL REQUERIDO" in _dumps(view.kpis)
+    assert "ADL" in _dumps(view.alert) and "ADL EN CURSO" in _dumps(view.kpis)
 
     tape = MarketTape()
     for tab, outputs in TAB_OUTPUTS.items():
@@ -327,7 +392,8 @@ def test_dash_tabs_and_adl_events(app_env):
     acc = tab_view(repo, tape, "accounts")
     assert [r["agent_name"] for r in acc["acc-table"]] == ["arb"]
     assert acc["pos-table"][0]["symbol"] == "BTC" and acc["pos-table"][0]["mark_price"] == 85_500.0
-    assert tab_view(repo, tape, "adl")["adl-table"][0]["shortfall"] == pytest.approx(360)
+    adl_tab = tab_view(repo, tape, "adl")
+    assert adl_tab["adl-table"] == [] and "Fondo en déficit" in _dumps(adl_tab["adl-callout"])
     liqmap = tab_view(repo, tape, "liqmap")
     # arb (3x, 100k de colateral) no tiene precio de liquidación a ±15 %: estado vacío explícito
     assert not liqmap["liqmap-graph"].data and "±15%" in _dumps(liqmap["liqmap-graph"])

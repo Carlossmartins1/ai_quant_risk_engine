@@ -28,9 +28,10 @@ GOOD = "#16C784"
 WARN = "#F0B90B"
 CRITICAL = "#EA3943"
 NEUTRAL = "#5D6778"
+ADL = "#E87BA4"            # recuperado por Auto-Deleveraging
 
 LEDGER_COLORS = {"CAPITAL_INJECTION": SIM, "LIQUIDATION_FEE": GOOD, "BANKRUPTCY_DEFICIT": CRITICAL,
-                 "ADJUSTMENT": NEUTRAL}
+                 "ADJUSTMENT": NEUTRAL, "ADL_RECOVERY": ADL}
 REGIME_COLORS = {"LIVE_TESTNET": SIM, "STRESS_MONTE_CARLO": WARN}
 STATE_COLORS = {"Sana": GOOD, "En riesgo": WARN, "Liquidable": CRITICAL, "Sin precio": NEUTRAL,
                 "Sin posiciones": NEUTRAL}
