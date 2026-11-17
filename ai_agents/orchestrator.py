@@ -394,9 +394,28 @@ class Orchestrator:
              "fund_balance": self._fund_balance, "source": getattr(self._source, "name", None),
              "adl_events": n_adl, "adl_recovered_usd": round(adl_recovered, 2),
              "stress_coverage": None if self.coverage is None else self.coverage.as_dict(),
-             "risk": self._portfolio_risk(),
+             "risk": self._portfolio_risk(), "feed": self._feed_status(),
              "agents": {name: uid for name, uid in self._user_ids.items()}},
         )
+
+    def _feed_status(self) -> dict[str, Any]:
+        """Referencia real de Hyperliquid (si hay feed en vivo) para compararla con el mercado sombra."""
+        store = self.live_source.store if self.live_source is not None else None
+        if store is None:
+            return {"configured": False, "connected": False, "symbols": {}}
+        now = time.time()
+        symbols: dict[str, dict[str, Any]] = {}
+        for s, snap in store.snapshot().items():
+            if snap.ctx is None:
+                continue
+            book = snap.book
+            symbols[s] = {
+                "mark": snap.ctx.mark_price, "oracle": snap.ctx.oracle_price,
+                "funding_hourly": snap.ctx.funding_rate_hourly, "age_ms": round(snap.age_s(now) * 1e3, 1),
+                # latencia exchange -> proceso (reloj del exchange vs recepción local)
+                "latency_ms": round(book.received_at * 1e3 - book.exchange_time_ms, 1) if book else None,
+            }
+        return {"configured": True, "connected": store.connected, "symbols": symbols}
 
     def _portfolio_risk(self) -> dict[str, Any] | None:
         """

@@ -361,5 +361,6 @@ class ShadowMarket:
                 "mark": snap.ctx.mark_price, "oracle": snap.ctx.oracle_price,
                 "basis_bps": snap.ctx.mark_oracle_basis_bps, "liquidity": self.liquidity(s),
                 "spread_bps": snap.book.spread_bps if snap.book else float("nan"),
+                "funding_hourly": snap.ctx.funding_rate_hourly,
             }
         return out
