@@ -283,6 +283,7 @@ def test_dash_app_renders_and_triggers_commands(app_env):
 
     controls = controls_view(repo, None)
     assert controls.normal_disabled and not controls.black_swan_disabled        # ya en NORMAL
+    assert not controls.password_required                                     # sin contraseña: campo oculto
     toast = _fire(client, "confirm-black-swan")
     assert toast["is_open"] and "Cisne Negro" in toast["children"] and toast["icon"] == "success"
     _fire(client, "confirm-reset")
@@ -361,7 +362,7 @@ def test_dash_controls_require_operator_password(app_env, monkeypatch):
     repo = DashboardRepository(app_env)
     client = create_app(repo).server.test_client()
     v = controls_view(repo, None)
-    assert v.normal_disabled and v.black_swan_disabled and v.reset_disabled
+    assert v.normal_disabled and v.black_swan_disabled and v.reset_disabled and v.password_required
     toast = _fire(client, "confirm-black-swan", "wrong")                          # validado en el servidor
     assert toast["icon"] == "danger" and "incorrecta" in toast["children"] and _commands(app_env) == []
     assert not controls_view(repo, "s3cret").reset_disabled

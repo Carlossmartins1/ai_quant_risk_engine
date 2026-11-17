@@ -66,6 +66,13 @@ from database.connection import DatabaseManager, DBConfig  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
+try:  # .env antes de construir el layout: DASHBOARD_ADMIN_PASSWORD decide si se muestra el campo de operador
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env", override=False)
+except ImportError:  # python-dotenv es opcional en runtime
+    pass
+
 FONTS = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
 TABS = ("accounts", "liqmap", "liquidations", "adl", "feed")
 LIQMAP_BAND = 0.15
@@ -157,6 +164,7 @@ class ControlsView:
     black_swan_disabled: bool
     reset_disabled: bool
     auth_hint: str
+    password_required: bool
     commands: list[dict[str, Any]]
 
 
@@ -177,6 +185,7 @@ def controls_view(repo: DashboardRepository, password: str | None) -> ControlsVi
         reset_disabled=not authorized,
         auth_hint=hint,
         commands=ui.records(_command_status(repo.recent_commands()), ui.COMMAND_COLUMNS),
+        password_required=bool(operator_password()),
     )
 
 
@@ -322,8 +331,10 @@ def _confirm_button(trigger: str, button_id: str, label: str, color: str, messag
 
 
 def sidebar(password_required: bool) -> html.Div:
+    # Sin debounce: los botones se habilitan en cuanto la contraseña es correcta (sin pulsar Enter).
+    # La visibilidad se recalcula en cada refresco (refresh_controls), no solo al construir el layout.
     auth = [dbc.Input(id="operator-pwd", type="password", placeholder="Contraseña de operador", className="mb-2",
-                      debounce=True, style={} if password_required else {"display": "none"})]
+                      style={} if password_required else {"display": "none"})]
     return html.Div([
         html.Div("Orquestador", className="panel-title"),
         html.Div(id="orch-status", className="mb-4"),
@@ -474,14 +485,17 @@ def create_app(repo: DashboardRepository | None = None, *, refresh_ms: int | Non
     @app.callback(
         Output("orch-status", "children"), Output("btn-normal", "disabled"), Output("btn-black-swan", "disabled"),
         Output("btn-reset", "disabled"), Output("auth-hint", "children"), Output("commands-table", "data"),
+        Output("operator-pwd", "style"),
         Input("tick", "n_intervals"), Input("operator-pwd", "value"),
     )
     def refresh_controls(_n: int, password: str | None):
+        pwd_style = {} if operator_password() else {"display": "none"}
         try:
             v = controls_view(provider.get(), password)
         except Exception:  # noqa: BLE001
-            return ui.orchestrator_status(None), True, True, True, "", []
-        return v.status, v.normal_disabled, v.black_swan_disabled, v.reset_disabled, v.auth_hint, v.commands
+            return ui.orchestrator_status(None), True, True, True, "", [], pwd_style
+        return (v.status, v.normal_disabled, v.black_swan_disabled, v.reset_disabled, v.auth_hint, v.commands,
+                pwd_style)
 
     @app.callback(
         Output("cmd-toast", "children"), Output("cmd-toast", "icon"), Output("cmd-toast", "is_open"),
