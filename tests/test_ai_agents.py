@@ -17,7 +17,9 @@ from ai_agents.orchestrator import Orchestrator, OrchestratorConfig
 from ai_agents.shadow_market import BaseQuote, MonteCarloPathSource, ReconvergingSource, ShadowMarket
 from ai_agents.trader_agents import (
     AccountView,
+    AgentAction,
     AgentPersona,
+    CircuitBreaker,
     LLMDecisionEngine,
     ManipulationPlan,
     MarketMode,
@@ -320,3 +322,66 @@ def test_orchestrator_returns_to_live_without_gap():
     fresh = Orchestrator(None, config=OrchestratorConfig(control_interval_s=None), agents=[], live_store=store)
     fresh._switch_mode(MarketMode.NORMAL)                            # arranque: sin estrés previo => live directo
     assert fresh._source.name == "live:hyperliquid"
+
+
+# ============================================================================= circuit breaker LLM
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_circuit_breaker_state_machine():
+    clock = _Clock()
+    cb = CircuitBreaker(failure_threshold=2, cooldown_s=30, clock=clock)
+    assert cb.allow() and not cb.record_failure() and cb.state == "CLOSED"
+    assert cb.record_failure() and cb.state == "OPEN" and not cb.allow()      # 2º fallo consecutivo: abre
+    clock.t = 31
+    assert cb.state == "HALF_OPEN" and cb.allow() and not cb.allow()          # una única sonda
+    cb.record_failure()
+    assert cb.state == "OPEN"                                                 # la sonda falla: reabre
+    clock.t = 62
+    assert cb.allow()
+    cb.record_success()
+    assert cb.state == "CLOSED" and cb.allow()
+
+
+def test_open_circuit_skips_the_llm_entirely():
+    calls = {"n": 0}
+
+    def failing_chain(schema):
+        def boom(_):
+            calls["n"] += 1
+            raise TimeoutError("openai down")
+        return RunnableLambda(boom)
+
+    breaker = CircuitBreaker(failure_threshold=2, cooldown_s=60)
+    agent = TradingAgent(AgentPersona.whale(), engine=LLMDecisionEngine(chain_factory=failing_chain), breaker=breaker)
+    obs = MarketObservation(MarketMode.NORMAL, {"BTC": 95_000.0, "ETH": 3_500.0}, {"BTC": 95_000.0, "ETH": 3_500.0},
+                            {"BTC": 0.0, "ETH": 0.0}, {"BTC": 0.5, "ETH": 0.6}, {"BTC": 1.0, "ETH": 1.0},
+                            returns_short={"BTC": 0.001, "ETH": 0.0})
+    account = AccountView(1, "whale_trader", 10_000.0, 10_000.0, 0.0, math.inf, 10_000.0, {})
+    sources = [agent.act(obs, account).source for _ in range(5)]
+    assert sources == ["RULES_FALLBACK", "RULES_FALLBACK"] + ["RULES_CIRCUIT_OPEN"] * 3
+    assert calls["n"] == 2                                                    # sin más timeouts tras abrir
+
+
+def test_burst_stops_pushing_price_after_gateway_reject():
+    """Una fracción rechazada (margen/límite) aborta la ráfaga: sin flujo fantasma contra el libro."""
+    from types import SimpleNamespace
+
+    from ai_agents.order_gateway import Fill
+
+    flows = []
+    orch = Orchestrator(None, config=OrchestratorConfig(control_interval_s=None), agents=[])
+    orch.market = SimpleNamespace(execute_flow=lambda sym, side, usd: flows.append(usd) or SimpleNamespace(vwap=100.0, filled_quantity=usd / 100))
+    statuses = iter(["FILLED", "FILLED", "REJECTED", "FILLED"])
+    orch.gateway = SimpleNamespace(execute=lambda uid, intents, **kw: (
+        Fill(intents[0].symbol, intents[0].delta_quantity, 0.0, 100.0, 0.0, 0.0, 0.0, next(statuses), "límite"),))
+    agent = TradingAgent(AgentPersona.manipulator())
+    burst = StressBurst(symbol="BTC", side="SELL", notional_usd=1_000_000, slices=10)
+    orch._execute(agent, 1, AgentAction(agent.name, agent.persona.profile, "RULES", "t", bursts=(burst,)))
+    assert len(flows) == 3                                                    # 2 OK + la rechazada; no 10
+    assert orch._actions[-1]["rejected"] == 1

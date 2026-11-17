@@ -456,8 +456,15 @@ class Orchestrator:
                     break
                 signed = flow.filled_quantity if burst.side == "BUY" else -flow.filled_quantity
                 intent = OrderIntent(burst.symbol, signed, flow.vwap, False, "stress burst")
-                fills.extend(self.gateway.execute(uid, [intent], leverage=p.max_leverage,
-                                                  price_overrides={burst.symbol: flow.vwap}))
+                slice_fills = self.gateway.execute(uid, [intent], leverage=p.max_leverage,
+                                                   price_overrides={burst.symbol: flow.vwap})
+                fills.extend(slice_fills)
+                if any(f.status == "REJECTED" for f in slice_fills):
+                    # El flujo ya impactó el libro sombra pero nadie lo sostiene: no seguir empujando el precio
+                    # con órdenes fantasma (antes se ejecutaban las N fracciones aunque el gateway rechazara).
+                    log.warning("orchestrator.burst_aborted", agent=p.name, symbol=burst.symbol,
+                                reason=slice_fills[0].reason)
+                    break
         with self._rec_lock:
             self._actions.append({
                 "t": round(self._elapsed(), 3), "agent": p.name, "mode": self._mode.value, "source": action.source,

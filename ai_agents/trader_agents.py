@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -68,6 +69,7 @@ __all__ = [
     "DecisionEngine",
     "RuleBasedEngine",
     "LLMDecisionEngine",
+    "CircuitBreaker",
     "TradingAgent",
     "default_agents",
     "LOT_DECIMALS",
@@ -266,11 +268,12 @@ def default_agents(
     ``whale_bias`` fija el sesgo de la política determinista de la ballena (con LLM decide el modelo).
     """
     use_llm = bool(os.getenv("OPENAI_API_KEY")) if use_llm is None else use_llm
+    breaker = CircuitBreaker() if use_llm else None   # un proveedor => un circuito compartido
     agents = []
     for persona in (AgentPersona.whale(directional_bias=whale_bias), AgentPersona.arbitrageur(),
                     AgentPersona.manipulator()):
         engine: DecisionEngine = LLMDecisionEngine(**engine_kwargs) if use_llm else RuleBasedEngine()
-        agents.append(TradingAgent(persona, engine=engine))
+        agents.append(TradingAgent(persona, engine=engine, breaker=breaker))
     return agents
 
 
@@ -294,7 +297,7 @@ class OrderIntent:
 class AgentAction:
     agent: str
     profile: AgentProfile
-    source: str                              # LLM | RULES | RULES_FALLBACK | SKIPPED
+    source: str                              # LLM | RULES | RULES_FALLBACK | RULES_CIRCUIT_OPEN | SKIPPED
     rationale: str
     intents: tuple[OrderIntent, ...] = ()
     bursts: tuple[StressBurst, ...] = ()
@@ -452,6 +455,62 @@ class LLMDecisionEngine:
         return result
 
 
+class CircuitBreaker:
+    """
+    Corta llamadas a un proveedor externo que está fallando (OpenAI caído, cuota agotada, 401...).
+
+    ``CLOSED`` → tras ``failure_threshold`` fallos consecutivos pasa a ``OPEN`` durante ``cooldown_s``
+    (las decisiones van directas a la política de reglas, sin esperar ``timeout × reintentos`` por agente
+    y ronda) → ``HALF_OPEN``: deja pasar UNA llamada de prueba; éxito => ``CLOSED``, fallo => ``OPEN``.
+    Compartido entre agentes (un único proveedor) y thread-safe: el orquestador decide en paralelo.
+    """
+
+    def __init__(self, failure_threshold: int = 3, cooldown_s: float = 60.0, *, clock: Any = time.monotonic) -> None:
+        if failure_threshold < 1 or cooldown_s <= 0:
+            raise ValueError("failure_threshold >= 1 y cooldown_s > 0")
+        self.failure_threshold = failure_threshold
+        self.cooldown_s = cooldown_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._probe_in_flight = False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state()
+
+    def _state(self) -> str:
+        if self._opened_at is None:
+            return "CLOSED"
+        return "OPEN" if self._clock() - self._opened_at < self.cooldown_s else "HALF_OPEN"
+
+    def allow(self) -> bool:
+        with self._lock:
+            state = self._state()
+            if state == "CLOSED":
+                return True
+            if state == "HALF_OPEN" and not self._probe_in_flight:
+                self._probe_in_flight = True
+                return True
+            return False
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures, self._opened_at, self._probe_in_flight = 0, None, False
+
+    def record_failure(self) -> bool:
+        """Registra un fallo. Devuelve ``True`` si el circuito acaba de abrirse."""
+        with self._lock:
+            self._failures += 1
+            was_open = self._opened_at is not None
+            if self._probe_in_flight or self._failures >= self.failure_threshold:
+                self._opened_at, self._probe_in_flight = self._clock(), False
+                return not was_open
+            return False
+
+
 # =============================================================================
 # Agente
 # =============================================================================
@@ -459,10 +518,12 @@ class TradingAgent:
     """Agente autónomo: decide (LLM o reglas), aplica guardarraíles y recuerda el resultado."""
 
     def __init__(self, persona: AgentPersona, *, engine: DecisionEngine | None = None,
-                 fallback: DecisionEngine | None = None, memory_size: int = 8) -> None:
+                 fallback: DecisionEngine | None = None, memory_size: int = 8,
+                 breaker: CircuitBreaker | None = None) -> None:
         self.persona = persona
         self.engine = engine or RuleBasedEngine()
         self.fallback = fallback or RuleBasedEngine()
+        self.breaker = breaker
         self.memory = AgentMemory(memory_size)
         self._log = log.bind(agent=persona.name, profile=persona.profile.value)
 
@@ -479,12 +540,21 @@ class TradingAgent:
             return AgentAction(p.name, p.profile, "SKIPPED", "Generador de estrés inactivo en modo normal.")
 
         source = self.engine.name
-        try:
-            decision = self.engine.decide(p, obs, account, self.memory)
-        except Exception as exc:  # noqa: BLE001 - cualquier fallo del LLM degrada a reglas
-            self._log.warning("agent.llm_fallback", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        if self.breaker is not None and not self.breaker.allow():
             decision = self.fallback.decide(p, obs, account, self.memory)
-            source = "RULES_FALLBACK"
+            source = "RULES_CIRCUIT_OPEN"
+        else:
+            try:
+                decision = self.engine.decide(p, obs, account, self.memory)
+                if self.breaker is not None:
+                    self.breaker.record_success()
+            except Exception as exc:  # noqa: BLE001 - cualquier fallo del LLM degrada a reglas
+                self._log.warning("agent.llm_fallback", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+                if self.breaker is not None and self.breaker.record_failure():
+                    self._log.error("agent.llm_circuit_open", cooldown_s=self.breaker.cooldown_s,
+                                    failures=self.breaker.failure_threshold)
+                decision = self.fallback.decide(p, obs, account, self.memory)
+                source = "RULES_FALLBACK"
 
         notes: list[str] = []
         if isinstance(decision, ManipulationPlan):
