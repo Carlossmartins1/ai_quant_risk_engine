@@ -73,6 +73,7 @@ from risk_engine.liquidation_executor import (
     MarketRegime,
 )
 from risk_engine.margin_calculator import MarginCalculator
+from risk_engine.risk_limits import StressCoverage, stress_coverage
 
 __all__ = ["OrchestratorConfig", "SimulationReport", "Orchestrator"]
 
@@ -103,6 +104,7 @@ class OrchestratorConfig:
     momentum_window: int = 12
     llm_workers: int = 3
     control_interval_s: float | None = 1.0  # plano de control (dashboard); None = desactivado
+    stress_jump: float = 0.30              # salto adverso del chequeo pre-flight de cobertura del Insurance Fund
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ class Orchestrator:
         self._mode_changes: list[tuple[float, str]] = []
         self._fund_balance = math.nan
         self._fund_min = math.inf
+        self.coverage: StressCoverage | None = None
         self._errors = 0
 
     # ------------------------------------------------------------- control
@@ -198,11 +201,16 @@ class Orchestrator:
         with self.db.transaction() as cur:
             for agent in self.agents:
                 p = agent.persona
+                # Los límites de riesgo viven en la cuenta (los aplica el gateway): se sincronizan siempre con
+                # la persona/CLI para que una recalibración surta efecto también sobre cuentas existentes
                 cur.execute(
-                    """INSERT INTO users_collateral (agent_name, agent_profile, deposited_collateral, max_leverage)
-                       VALUES (%s, %s, %s, %s)
-                       ON CONFLICT (agent_name) DO NOTHING""",
-                    (p.name, p.profile.value, p.initial_collateral, p.max_leverage),
+                    """INSERT INTO users_collateral (agent_name, agent_profile, deposited_collateral, max_leverage,
+                                                     max_gross_notional_usd)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (agent_name) DO UPDATE
+                          SET max_leverage = EXCLUDED.max_leverage,
+                              max_gross_notional_usd = EXCLUDED.max_gross_notional_usd""",
+                    (p.name, p.profile.value, p.initial_collateral, p.max_leverage, p.max_gross_notional_usd),
                 )
                 cur.execute("SELECT user_id FROM users_collateral WHERE agent_name = %s", (p.name,))
                 uid = cur.fetchone()["user_id"]
@@ -210,7 +218,19 @@ class Orchestrator:
                 if self.cfg.reset_accounts:
                     self._reset_account(cur, uid, p.initial_collateral)
         log.info("orchestrator.bootstrap", accounts=self._user_ids)
+        self.coverage = self.check_stress_coverage(self._fetch_fund_balance())
         return dict(self._user_ids)
+
+    def check_stress_coverage(self, insurance_fund: float) -> StressCoverage:
+        """Pre-flight: ¿absorbe el Insurance Fund el peor déficit de los agentes al máximo de sus límites?"""
+        cov = stress_coverage(((a.persona.name, a.persona.initial_collateral, a.persona.limits) for a in self.agents),
+                              insurance_fund, self.cfg.stress_jump)
+        (log.info if cov.adequate else log.warning)(
+            "orchestrator.stress_coverage", ratio=None if math.isinf(cov.ratio) else round(cov.ratio, 3),
+            jump=cov.jump, worst_deficit=round(cov.worst_deficit, 2), insurance_fund=round(insurance_fund, 2),
+            hint=None if cov.adequate else "recalibra --max-leverage/--max-notional o capitaliza --insurance-fund; "
+                                           "si el escenario se materializa actuará el ADL")
+        return cov
 
     def reset_agents(self) -> None:
         """
@@ -451,7 +471,12 @@ class Orchestrator:
         for burst in action.bursts:
             # El flujo tóxico se cruza contra el libro SOMBRA y el manipulador queda con la posición resultante
             for _ in range(burst.slices):
-                flow = self.market.execute_flow(burst.symbol, burst.side, burst.notional_usd / burst.slices)
+                # Pre-check sin lock: no cruzar contra el libro más flujo del que la cuenta puede sostener
+                slice_usd = min(burst.notional_usd / burst.slices, self.gateway.headroom_usd(uid))
+                if slice_usd < 1_000:
+                    log.info("orchestrator.burst_capped", agent=p.name, symbol=burst.symbol, reason="sin headroom")
+                    break
+                flow = self.market.execute_flow(burst.symbol, burst.side, slice_usd)
                 if flow.vwap is None or flow.filled_quantity <= 0:
                     break
                 signed = flow.filled_quantity if burst.side == "BUY" else -flow.filled_quantity
@@ -520,6 +545,45 @@ class Orchestrator:
 # =============================================================================
 # CLI
 # =============================================================================
+def parse_overrides(items: Sequence[str], *, allow_none: bool = False) -> dict[str, float | None]:
+    """``["whale_trader=10", "arbitrageur=none"]`` -> ``{"whale_trader": 10.0, "arbitrageur": None}``."""
+    out: dict[str, float | None] = {}
+    for item in items:
+        name, sep, value = item.partition("=")
+        if not sep or not name.strip():
+            raise ValueError(f"formato esperado AGENTE=VALOR: {item!r}")
+        if allow_none and value.strip().lower() in {"none", "inf", ""}:
+            out[name.strip()] = None
+            continue
+        v = float(value)
+        if not v > 0:
+            raise ValueError(f"el límite debe ser > 0: {item!r}")
+        out[name.strip()] = v
+    return out
+
+
+def apply_limit_overrides(agents: Sequence[TradingAgent], *, max_leverage: Mapping[str, float | None] | None = None,
+                          max_notional: Mapping[str, float | None] | None = None) -> list[TradingAgent]:
+    """Recalibra los límites de riesgo de los agentes (CLI). Falla si un nombre no existe."""
+    max_leverage, max_notional = dict(max_leverage or {}), dict(max_notional or {})
+    unknown = (set(max_leverage) | set(max_notional)) - {a.persona.name for a in agents}
+    if unknown:
+        raise ValueError(f"agentes desconocidos en los límites: {sorted(unknown)}")
+    for a in agents:
+        changes: dict[str, Any] = {}
+        if a.persona.name in max_leverage:
+            lev = max_leverage[a.persona.name]
+            if lev is None:
+                raise ValueError("max_leverage no admite 'none'")
+            changes.update(max_leverage=lev, target_leverage=min(a.persona.target_leverage, lev))
+        if a.persona.name in max_notional:
+            changes["max_gross_notional_usd"] = max_notional[a.persona.name]
+        if changes:
+            a.persona = replace(a.persona, **changes)
+            log.info("orchestrator.limits_override", agent=a.persona.name, **changes)
+    return list(agents)
+
+
 def main() -> None:  # pragma: no cover - punto de entrada interactivo
     from common.logging_config import configure_logging
     from database.connection import get_db
@@ -540,6 +604,12 @@ def main() -> None:  # pragma: no cover - punto de entrada interactivo
     parser.add_argument("--whale-bias", choices=["LONG", "SHORT", "MOMENTUM"], default="LONG",
                         help="sesgo de la ballena (política determinista). LONG = objetivo del cisne negro")
     parser.add_argument("--no-llm", action="store_true", help="fuerza la política determinista aunque haya API key")
+    parser.add_argument("--max-leverage", action="append", default=[], metavar="AGENTE=X",
+                        help="límite de apalancamiento bruto por agente (repetible), p.ej. market_manipulator=2")
+    parser.add_argument("--max-notional", action="append", default=[], metavar="AGENTE=USD",
+                        help="tope de nocional bruto por agente (repetible; 'none' = sin tope), p.ej. whale_trader=1e5")
+    parser.add_argument("--stress-jump", type=float, default=OrchestratorConfig.stress_jump,
+                        help="salto adverso del chequeo pre-flight de cobertura del Insurance Fund")
     args = parser.parse_args()
 
     configure_logging()
@@ -562,8 +632,11 @@ def main() -> None:  # pragma: no cover - punto de entrada interactivo
             raise SystemExit("Sin datos del feed de Hyperliquid en 20 s")
 
     cfg = OrchestratorConfig(tick_interval_s=args.tick, black_swan_after_s=args.black_swan_at, seed=args.seed,
-                             stress_crash_steps=args.crash_steps, reconverge_half_life_ticks=args.reconverge_ticks)
-    agents = default_agents(whale_bias=args.whale_bias, use_llm=False if args.no_llm else None)
+                             stress_crash_steps=args.crash_steps, reconverge_half_life_ticks=args.reconverge_ticks,
+                             stress_jump=args.stress_jump)
+    agents = apply_limit_overrides(default_agents(whale_bias=args.whale_bias, use_llm=False if args.no_llm else None),
+                                   max_leverage=parse_overrides(args.max_leverage),
+                                   max_notional=parse_overrides(args.max_notional, allow_none=True))
     orch = Orchestrator(db, config=cfg, agents=agents, live_store=feed.store if feed else None)
     for sig in (signal.SIGTERM, signal.SIGINT):  # parada ordenada en `docker stop` / Ctrl-C
         signal.signal(sig, lambda *_: orch.stop())

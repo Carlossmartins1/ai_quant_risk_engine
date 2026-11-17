@@ -37,6 +37,7 @@ services:
       - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./database/migrations/002_simulation_control.sql:/docker-entrypoint-initdb.d/02_simulation_control.sql:ro
       - ./database/migrations/003_reset_agents_command.sql:/docker-entrypoint-initdb.d/03_reset_agents_command.sql:ro
+      - ./database/migrations/004_risk_limits.sql:/docker-entrypoint-initdb.d/04_risk_limits.sql:ro
 
     # Tuning orientado a un motor OLTP con alta contención de filas (SELECT ... FOR UPDATE)
     command:

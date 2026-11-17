@@ -28,13 +28,15 @@ def make_store(markets: dict, *, connected: bool = True):
 
 
 def seed_account(db: DatabaseManager, name: str, profile: str, collateral: float,
-                 positions: Iterable[tuple[str, float, float, float, float]] = (), status: str = "ACTIVE") -> int:
+                 positions: Iterable[tuple[str, float, float, float, float]] = (), status: str = "ACTIVE",
+                 *, max_leverage: float = 20.0, max_gross_notional: float | None = None) -> int:
     """positions: (symbol, quantity, entry_price, leverage, maintenance_margin_rate)"""
     with db.transaction() as cur:
         cur.execute(
-            """INSERT INTO users_collateral (agent_name, agent_profile, deposited_collateral, account_status)
-               VALUES (%s, %s, %s, %s) RETURNING user_id""",
-            (name, profile, collateral, status),
+            """INSERT INTO users_collateral (agent_name, agent_profile, deposited_collateral, account_status,
+                                             max_leverage, max_gross_notional_usd)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING user_id""",
+            (name, profile, collateral, status, max_leverage, max_gross_notional),
         )
         user_id = cur.fetchone()["user_id"]
         for sym, qty, entry, lev, mmr in positions:

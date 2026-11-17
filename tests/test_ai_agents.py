@@ -63,7 +63,7 @@ def test_whale_leverage_clamped_and_symbols_filtered():
     action = TradingAgent(persona, engine=FixedEngine(decision)).act(obs(), account(10_000))
     (intent,) = action.intents
     assert intent.symbol == "BTC" and intent.notional == pytest.approx(200_000, rel=1e-4)  # 20x
-    assert any("recortado a 20x" in n for n in action.guardrail_notes)
+    assert any("recortada a 200,000 USD" in n for n in action.guardrail_notes)
     assert any("ETH no permitido" in n for n in action.guardrail_notes)
     assert intent.delta_quantity == round(intent.delta_quantity, 5)  # lot size BTC
 
@@ -378,7 +378,7 @@ def test_burst_stops_pushing_price_after_gateway_reject():
     orch = Orchestrator(None, config=OrchestratorConfig(control_interval_s=None), agents=[])
     orch.market = SimpleNamespace(execute_flow=lambda sym, side, usd: flows.append(usd) or SimpleNamespace(vwap=100.0, filled_quantity=usd / 100))
     statuses = iter(["FILLED", "FILLED", "REJECTED", "FILLED"])
-    orch.gateway = SimpleNamespace(execute=lambda uid, intents, **kw: (
+    orch.gateway = SimpleNamespace(headroom_usd=lambda uid: 1e12, execute=lambda uid, intents, **kw: (
         Fill(intents[0].symbol, intents[0].delta_quantity, 0.0, 100.0, 0.0, 0.0, 0.0, next(statuses), "límite"),))
     agent = TradingAgent(AgentPersona.manipulator())
     burst = StressBurst(symbol="BTC", side="SELL", notional_usd=1_000_000, slices=10)

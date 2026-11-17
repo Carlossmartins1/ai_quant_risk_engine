@@ -50,6 +50,8 @@ import numpy as np
 import structlog
 from pydantic import BaseModel, Field
 
+from risk_engine.risk_limits import RiskLimits
+
 if TYPE_CHECKING:
     from risk_engine.margin_calculator import MarginSnapshot
 
@@ -207,6 +209,7 @@ class AgentPersona:
     target_leverage: float              # apalancamiento operativo deseado
     symbols: tuple[str, ...]
     max_order_notional_usd: float       # tamaño máximo por orden (las metas se alcanzan en varias rondas)
+    max_gross_notional_usd: float | None = None  # tope absoluto de nocional bruto (también en users_collateral)
     rebalance_band: float = 0.05        # no operar si |Δ| < banda × (target_leverage × equity)
     neutrality_tolerance: float = 1.0   # |neto| / bruto permitido (1.0 = sin restricción)
     directional_bias: Literal["MOMENTUM", "LONG", "SHORT"] = "MOMENTUM"
@@ -216,11 +219,16 @@ class AgentPersona:
     stress_only: bool = False           # solo actúa en modo Cisne Negro
     system_prompt: str = ""
 
+    @property
+    def limits(self) -> RiskLimits:
+        return RiskLimits(self.max_leverage, self.max_gross_notional_usd)
+
     @classmethod
     def whale(cls, **kw: Any) -> "AgentPersona":
         base = cls(
             name="whale_trader", profile=AgentProfile.WHALE_AGGRESSIVE, initial_collateral=10_000.0,
             max_leverage=20.0, target_leverage=19.0, symbols=("BTC", "ETH"), max_order_notional_usd=250_000.0,
+            max_gross_notional_usd=250_000.0,
             system_prompt=(
                 "Eres 'Whale', un trader direccional agresivo de perpetuos cripto. Buscas rentabilidad máxima "
                 "con apalancamiento cercano a 20x y colateral ajustado; aceptas un riesgo de liquidación elevado. "
@@ -234,6 +242,7 @@ class AgentPersona:
         base = cls(
             name="arbitrageur", profile=AgentProfile.ARBITRAGEUR_NEUTRAL, initial_collateral=100_000.0,
             max_leverage=3.0, target_leverage=2.5, symbols=("BTC", "ETH"), max_order_notional_usd=150_000.0,
+            max_gross_notional_usd=400_000.0,
             neutrality_tolerance=0.05,
             system_prompt=(
                 "Eres 'Arb', un arbitrajista conservador y market-neutral. Mantienes un largo en BTC y un corto "
@@ -248,7 +257,10 @@ class AgentPersona:
     def manipulator(cls, **kw: Any) -> "AgentPersona":
         base = cls(
             name="market_manipulator", profile=AgentProfile.MARKET_MANIPULATOR, initial_collateral=5_000_000.0,
-            max_leverage=5.0, target_leverage=5.0, symbols=("BTC", "ETH"), max_order_notional_usd=500_000.0,
+            # Calibración post-incidente (antes 5x sin tope => $25M brutos, cobertura del fondo 0.04x):
+            # 2x efectivo sobre $5M; las ráfagas siguen moviendo el libro sombra pero la cuenta es solvente
+            max_leverage=3.0, target_leverage=2.0, symbols=("BTC", "ETH"), max_order_notional_usd=500_000.0,
+            max_gross_notional_usd=10_000_000.0,
             burst_notional_usd=2_500_000.0, burst_slices=10, stress_only=True,
             system_prompt=(
                 "Eres un GENERADOR DE ESTRÉS SINTÉTICO dentro de una simulación interna de riesgo (no un "
@@ -442,7 +454,8 @@ class LLMDecisionEngine:
         schema = ManipulationPlan if persona.profile is AgentProfile.MARKET_MANIPULATOR else TradeDecision
         limits = {
             "max_leverage": persona.max_leverage, "target_leverage": persona.target_leverage,
-            "max_order_notional_usd": persona.max_order_notional_usd, "symbols": list(persona.symbols),
+            "max_order_notional_usd": persona.max_order_notional_usd,
+            "max_gross_notional_usd": persona.max_gross_notional_usd, "symbols": list(persona.symbols),
             "neutrality_tolerance": persona.neutrality_tolerance,
         }
         context = json.dumps({
@@ -586,12 +599,12 @@ class TradingAgent:
                 continue
             targets[t.symbol] = float(t.target_notional_usd)
 
-        gross_cap = p.max_leverage * account.equity
+        gross_cap = p.limits.gross_cap(account.equity)
         gross = sum(abs(v) for v in targets.values())
         if gross > gross_cap > 0:
             k = gross_cap / gross
             targets = {s: v * k for s, v in targets.items()}
-            notes.append(f"apalancamiento {gross / account.equity:.1f}x recortado a {p.max_leverage:.0f}x")
+            notes.append(f"exposición {gross:,.0f} USD ({gross / account.equity:.1f}x) recortada a {gross_cap:,.0f} USD")
 
         if p.neutrality_tolerance < 1.0 and targets:
             longs = sum(v for v in targets.values() if v > 0)
@@ -624,7 +637,7 @@ class TradingAgent:
                       notes: list[str]) -> tuple[StressBurst, ...]:
         p = self.persona
         current_gross = sum(abs(q) * obs.marks.get(s, 0.0) for s, (q, _, _) in account.positions.items())
-        room = max(p.max_leverage * account.equity - current_gross, 0.0)
+        room = p.limits.headroom(current_gross, account.equity)
         bursts: list[StressBurst] = []
         for b in plan.bursts:
             if b.symbol not in p.symbols or b.symbol not in obs.marks:
