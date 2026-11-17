@@ -1,254 +1,254 @@
 # AI-Driven Quant Risk & Liquidation Engine
 
-**Motor de riesgo para derivados perpetuos cripto (Hyperliquid) con margen cruzado vectorizado, liquidaciones atómicas sobre PostgreSQL, Insurance Fund, Auto-Deleveraging y un mercado sombra que agentes de IA estresan con escenarios de Cisne Negro.**
+**A risk engine for crypto perpetual futures (Hyperliquid): vectorized cross-margin, atomic liquidations on PostgreSQL, an Insurance Fund, Auto-Deleveraging, and a shadow market that AI agents stress-test with Black Swan scenarios.**
 
 ![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-336791?logo=postgresql&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-135%20passing-0ca30c)
 ![Docker](https://img.shields.io/badge/deploy-Docker%20%C2%B7%20AWS%20EC2-2496ed?logo=docker&logoColor=white)
 
-![Demo del dashboard](RESULTADOS/demo_dashboard.gif)
+![Dashboard demo](RESULTADOS/demo_dashboard.gif)
 
-<sub>Vídeo completo: [`RESULTADOS/demo_dashboard.mp4`](RESULTADOS/demo_dashboard.mp4) · [`.webm`](RESULTADOS/demo_dashboard.webm)</sub>
+<sub>Full recording: [`RESULTADOS/demo_dashboard.mp4`](RESULTADOS/demo_dashboard.mp4) · [`.webm`](RESULTADOS/demo_dashboard.webm). The UI and code comments are in Spanish.</sub>
 
 ---
 
-## En 30 segundos
+## At a glance
 
 | | |
 |---|---|
-| **Problema** | Un exchange de perpetuos debe decidir en milisegundos qué cuentas liquidar, cerrarlas sin dejar el sistema en un estado intermedio y absorber el *bad debt* cuando el precio atraviesa el de bancarrota. Si el Insurance Fund no basta, alguien tiene que pagar. |
-| **Qué hace** | Calcula el margen cruzado de todas las cuentas en una pasada NumPy, liquida cada cuenta en **una única transacción ACID**, cobra comisiones o absorbe déficits en un **Insurance Fund con libro mayor inmutable** y, si el fondo queda en negativo, ejecuta un **ADL pro-rata** sobre las posiciones ganadoras. |
-| **Cómo se prueba** | Tres agentes (LLM con salida estructurada o política determinista) operan contra un **mercado sombra** que replica el libro L2 de Hyperliquid. Un **Cisne Negro** Monte Carlo (difusión con saltos + Hawkes + colapso de liquidez) provoca la cascada. |
-| **Qué se ve** | Dashboard Streamlit en tiempo real: Insurance Fund, cobertura IF/Open Interest, VaR/ES 99 %, health ratio por cuenta, liquidaciones con slippage y el historial de ADL. |
-| **Calidad** | 135 tests (unitarios + integración contra PostgreSQL real + la app Streamlit con `AppTest`), migraciones con checksum, auditoría append-only exportada a S3, despliegue en EC2 sin puertos abiertos. |
+| **Problem** | A perpetuals exchange must decide within milliseconds which accounts to liquidate, close them without ever leaving the system in a half-applied state, and absorb the bad debt when price gaps through the bankruptcy price. When the Insurance Fund is not enough, someone has to pay. |
+| **What it does** | Computes cross-margin for every account in a single NumPy pass, liquidates each account in **one ACID transaction**, collects fees or absorbs deficits in an **Insurance Fund backed by an immutable ledger** and, if the fund goes negative, runs a **pro-rata ADL** against winning positions. |
+| **How it is tested** | Three agents (LLM with structured output, or a deterministic policy) trade against a **shadow market** that mirrors Hyperliquid's L2 book. A Monte Carlo **Black Swan** (jump diffusion + Hawkes intensity + liquidity collapse) triggers the cascade. |
+| **What you see** | A real-time Streamlit dashboard: Insurance Fund, fund/Open Interest coverage, 99% VaR/ES, per-account health ratio, liquidations with slippage and the ADL history. |
+| **Engineering quality** | 135 tests (unit + integration against a real PostgreSQL + the Streamlit app via `AppTest`), checksummed migrations, append-only audit trail exported to S3, EC2 deployment with no inbound ports. |
 
 ---
 
-## Arquitectura
+## Architecture
 
 ```mermaid
 flowchart LR
     subgraph EXT["Hyperliquid Testnet"]
         WS["WebSocket<br/>L2 · mark · oracle · funding"]
-        REST["REST + SDK<br/>órdenes idempotentes (cloid)"]
+        REST["REST + SDK<br/>idempotent orders (cloid)"]
     end
 
-    subgraph MKT["Mercado sombra"]
-        STORE["MarketDataStore<br/>snapshots inmutables"]
-        MC["Monte Carlo Cisne Negro<br/>saltos · Hawkes · liquidez"]
-        RECON["ReconvergingSource<br/>vuelta al live sin gap"]
-        SHADOW["Libro L2 sombra<br/>+ impacto del flujo tóxico"]
+    subgraph MKT["Shadow market"]
+        STORE["MarketDataStore<br/>immutable snapshots"]
+        MC["Black Swan Monte Carlo<br/>jumps · Hawkes · liquidity"]
+        RECON["ReconvergingSource<br/>gap-free return to live"]
+        SHADOW["Shadow L2 book<br/>+ toxic-flow impact"]
     end
 
-    subgraph ORCH["Orquestador"]
-        AG["Agentes IA<br/>LLM + circuit breaker"]
-        GW["OrderGateway<br/>margen inicial + límites de riesgo"]
-        RISK["MarginCalculator<br/>cross-margin NumPy"]
-        LIQ["LiquidationExecutor<br/>1 cuenta = 1 TX ACID"]
+    subgraph ORCH["Orchestrator"]
+        AG["AI agents<br/>LLM + circuit breaker"]
+        GW["OrderGateway<br/>initial margin + risk limits"]
+        RISK["MarginCalculator<br/>NumPy cross-margin"]
+        LIQ["LiquidationExecutor<br/>1 account = 1 ACID TX"]
         ADL["AdlEngine<br/>pro-rata · water-filling"]
     end
 
-    DB[("PostgreSQL 15<br/>cuentas · posiciones<br/>Insurance Fund + libro mayor<br/>auditoría append-only<br/>plano de control")]
-    DASH["Dashboard Streamlit<br/>KPIs · VaR/ES · ADL"]
-    S3[("S3 · SSE-KMS<br/>logs + auditoría")]
+    DB[("PostgreSQL 15<br/>accounts · positions<br/>Insurance Fund + ledger<br/>append-only audit<br/>control plane")]
+    DASH["Streamlit dashboard<br/>KPIs · VaR/ES · ADL"]
+    S3[("S3 · SSE-KMS<br/>logs + audit")]
 
     WS --> STORE --> RECON --> SHADOW
     MC --> SHADOW
     SHADOW --> AG --> GW --> DB
     SHADOW --> RISK --> LIQ --> DB
-    LIQ -- "fondo negativo" --> ADL --> DB
-    LIQ -. "modo live" .-> REST
-    DB -- "lecturas MVCC" --> DASH
-    DASH -- "comandos" --> DB
+    LIQ -- "fund negative" --> ADL --> DB
+    LIQ -. "live mode" .-> REST
+    DB -- "MVCC reads" --> DASH
+    DASH -- "commands" --> DB
     DB --> S3
 ```
 
-| Módulo | Responsabilidad |
+| Module | Responsibility |
 |---|---|
-| [`exchange_connector/`](exchange_connector) | WebSocket con reconexión, heartbeat y watchdog; cliente REST con redondeo tick/lot conservador, reintentos con backoff + jitter y **reconciliación por `cloid`** antes de reintentar (una orden nunca se duplica por un timeout). |
-| [`quant_models/`](quant_models) | GARCH/GJR/EGARCH (selección por BIC), VaR/ES histórico, filtrado, paramétrico Normal/t y Cornish-Fisher, **backtest de Kupiec**, Monte Carlo multi-activo con saltos sistémicos, intensidad Hawkes y factor de liquidez. |
-| [`risk_engine/`](risk_engine) | Margen cruzado, liquidación atómica, **límites de riesgo**, **Auto-Deleveraging**. |
-| [`ai_agents/`](ai_agents) | Agentes (LangChain + Pydantic), guardarraíles, mercado sombra, pasarela de órdenes, orquestador y plano de control. |
-| [`database/`](database) | Esquema, protocolo de locks, migraciones idempotentes con checksum y advisory lock. |
-| [`dashboard/`](dashboard) | Centro de control en tiempo real (solo lectura MVCC + cola de comandos). |
-| [`deployment/`](deployment) | Imagen multi-target, compose de producción, EC2 + SSM + S3, export de auditoría. |
+| [`exchange_connector/`](exchange_connector) | WebSocket with reconnection, heartbeat and watchdog; REST client with conservative tick/lot rounding, retries with backoff + jitter and **reconciliation by `cloid`** before retrying (a timeout can never duplicate an order). |
+| [`quant_models/`](quant_models) | GARCH/GJR/EGARCH (BIC selection); historical, filtered, parametric Normal/t and Cornish-Fisher VaR/ES; **Kupiec backtest**; multi-asset Monte Carlo with systemic jumps, Hawkes intensity and a liquidity factor. |
+| [`risk_engine/`](risk_engine) | Cross-margin, atomic liquidation, **risk limits**, **Auto-Deleveraging**. |
+| [`ai_agents/`](ai_agents) | Agents (LangChain + Pydantic), guardrails, shadow market, order gateway, orchestrator and control plane. |
+| [`database/`](database) | Schema, locking protocol, idempotent migrations with checksums and an advisory lock. |
+| [`dashboard/`](dashboard) | Real-time control center (read-only MVCC queries + a command queue). |
+| [`deployment/`](deployment) | Multi-target image, production compose, EC2 + SSM + S3, audit export. |
 
 ---
 
-## Motor de margen cruzado
+## Cross-margin engine
 
-En *cross margin* todo el colateral de la cuenta respalda todas sus posiciones. Para cada cuenta `u` con posiciones `i` (cantidad con signo `q`, precio de entrada `e`, mark `m`, tasa de mantenimiento `mmr`):
+Under cross margin, an account's entire collateral backs all of its positions. For each account `u` with positions `i` (signed quantity `q`, entry price `e`, mark `m`, maintenance margin rate `mmr`):
 
 ```
 uPnL_i     = q_i · (m_i − e_i)
-Equity_u   = colateral_u + Σ uPnL_i
-MM_u       = Σ |q_i| · m_i · mmr_i                    margen de mantenimiento
-health_u   = Equity_u / MM_u                          liquidable  ⇔  health ≤ 1
-P_liq,i    = (MM_otros − Eq_otros + q·e) / (q − |q|·mmr)    precio de liquidación (resto de la cuenta fijo)
-P_bk,i     = e − Eq_otros / q                         precio de bancarrota: equity = 0
+Equity_u   = collateral_u + Σ uPnL_i
+MM_u       = Σ |q_i| · m_i · mmr_i                    maintenance margin
+health_u   = Equity_u / MM_u                          liquidatable  ⇔  health ≤ 1
+P_liq,i    = (MM_rest − Eq_rest + q·e) / (q − |q|·mmr)      liquidation price (rest of the account held fixed)
+P_bk,i     = e − Eq_rest / q                          bankruptcy price: equity = 0
 ```
 
-- **Vectorizado**: las métricas por posición se agregan por cuenta con `np.bincount`, sin bucles Python. **100 000 cuentas / 250 000 posiciones en ~115 ms** en un solo núcleo.
-- **Fail-safe**: una cuenta con algún precio desconocido o rancio no se evalúa (`missing_prices`): nunca se liquida con un mark viejo.
-- **Misma fórmula en todas partes**: el motor, la pasarela de órdenes, el ADL y el dashboard llaman a `compute_margins`.
+- **Vectorized**: per-position metrics are aggregated per account with `np.bincount`, no Python loops. **100,000 accounts / 250,000 positions in ~115 ms** on a single core.
+- **Fail-safe**: an account with any unknown or stale price is not evaluated (`missing_prices`), so nothing is ever liquidated on an old mark.
+- **One formula everywhere**: the engine, the order gateway, the ADL and the dashboard all call `compute_margins`.
 
-## Liquidaciones atómicas
+## Atomic liquidations
 
-Una liquidación de cuenta es **una transacción**: o se aplica entera o no ocurre.
+An account liquidation is **one transaction**: it applies in full or not at all.
 
 ```
 BEGIN  (READ COMMITTED · lock_timeout · statement_timeout)
-  1. SELECT … FROM users_collateral  FOR UPDATE NOWAIT     ← otro worker la tiene: SKIPPED_LOCKED
+  1. SELECT … FROM users_collateral  FOR UPDATE NOWAIT     ← held by another worker: SKIPPED_LOCKED
   2. SELECT … FROM open_positions    FOR UPDATE ORDER BY position_id
-  3. Re-evaluación bajo lock con precios frescos            ← el screening sin locks pudo quedar obsoleto
-  4. Ejecución: L2 sombra (+ backstop si el libro no absorbe) o Hyperliquid reduce-only
+  3. Re-evaluate under lock with fresh prices               ← the lock-free screening may be stale
+  4. Execution: shadow L2 (+ backstop if the book cannot absorb it) or Hyperliquid reduce-only
   5. open_positions → LIQUIDATED
-  6. INSERT liquidation_events                               ← append-only, batch UUID idempotente
-  7. SELECT … FROM insurance_fund    FOR UPDATE               ← ÚLTIMO lock: la fila caliente se retiene ms
-  8. fondo += fee − déficit  ·  INSERT insurance_fund_ledger
-  9. users_collateral → colateral residual, LIQUIDATED
+  6. INSERT liquidation_events                               ← append-only, idempotent batch UUID
+  7. SELECT … FROM insurance_fund    FOR UPDATE               ← LAST lock: the hot row is held for ms
+  8. fund += fee − deficit  ·  INSERT insurance_fund_ledger
+  9. users_collateral → residual collateral, LIQUIDATED
 COMMIT
 ```
 
-- **Orden de locks canónico** `users_collateral → open_positions → insurance_fund` en todo el sistema (pasarela, liquidador, ADL, reset): sin deadlocks; los residuales se reintentan con `retry_on_transient`.
-- **Economía exacta en `Decimal`**: la comisión nunca crea déficit (`fee ≤ equity_after⁺`), el déficit y la comisión se reparten entre posiciones con suma exacta, y las identidades contables están en `CHECK` (`fund_delta = fee − deficit`).
-- **Auditoría inmutable**: `liquidation_events`, `insurance_fund_ledger`, `adl_events` y `adl_fills` rechazan `UPDATE`/`DELETE` por trigger y se exportan incrementalmente a S3 (particionado Hive, consultable con Athena).
+- **Canonical lock order** `users_collateral → open_positions → insurance_fund` across the whole system (gateway, liquidator, ADL, reset): no deadlocks; residual transient failures are retried with `retry_on_transient`.
+- **Exact `Decimal` accounting**: the fee never creates a deficit (`fee ≤ equity_after⁺`), fee and deficit are allocated across positions with an exact sum, and the accounting identities are enforced by `CHECK` constraints (`fund_delta = fee − deficit`).
+- **Immutable audit trail**: `liquidation_events`, `insurance_fund_ledger`, `adl_events` and `adl_fills` reject `UPDATE`/`DELETE` via triggers and are exported incrementally to S3 (Hive-partitioned, queryable with Athena).
 
-## Cisne Negro y Auto-Deleveraging
+## Black Swan and Auto-Deleveraging
 
-### El escenario
+### The scenario
 
-El orquestador alterna el mercado sombra entre precios en vivo de Hyperliquid (o un Monte Carlo «normal») y un **régimen de estrés**: la trayectoria del percentil 5 de 2 000 simulaciones de difusión con saltos, con saltos autoexcitados (Hawkes), correlaciones que tienden a 1 y un factor de liquidez que vacía el libro. El agente generador de estrés inyecta flujo vendedor tóxico contra el libro sombra. La ballena 20x cae; el liquidador ejecuta contra un libro sin profundidad y el backstop asume el resto con descuento: aparece el déficit.
+The orchestrator switches the shadow market between live Hyperliquid prices (or a "normal" Monte Carlo) and a **stress regime**: the 5th-percentile path out of 2,000 jump-diffusion simulations, with self-exciting jumps (Hawkes), correlations converging to 1 and a liquidity factor that drains the book. The stress-generator agent injects toxic sell flow into the shadow book. The 20x whale goes under; the liquidator executes against a book with no depth and the backstop takes the rest at a discount, so a deficit appears.
 
-Al terminar el estrés con `--live`, el precio sombra **reconverge** al real con semivida configurable en lugar de saltar de golpe (ver el postmortem).
+When the stress regime ends in `--live` mode, the shadow price **reconverges** to the real one with a configurable half-life instead of jumping in a single tick (see the postmortem).
 
-### ADL: quién paga cuando el fondo no llega
+### ADL: who pays when the fund falls short
 
 ```mermaid
 sequenceDiagram
     participant R as LiquidationExecutor
     participant DB as PostgreSQL
     participant A as AdlEngine
-    R->>DB: TX 1 · liquidación (fondo += fee − déficit)
-    DB-->>R: COMMIT · balance = −$8 461
+    R->>DB: TX 1 · liquidation (fund += fee − deficit)
+    DB-->>R: COMMIT · balance = −$8,461
     R->>A: run(trigger_batch_id)
-    A->>DB: TX 2 · cuentas ACTIVE FOR UPDATE SKIP LOCKED (por user_id)
-    A->>DB: sus posiciones FOR UPDATE (por position_id)
-    A->>DB: insurance_fund FOR UPDATE (último) · relee el saldo
-    A->>A: φ mínimo por water-filling
-    A->>DB: reduce posiciones ganadoras · adl_events · adl_fills · ledger ADL_RECOVERY
+    A->>DB: TX 2 · ACTIVE accounts FOR UPDATE SKIP LOCKED (by user_id)
+    A->>DB: their positions FOR UPDATE (by position_id)
+    A->>DB: insurance_fund FOR UPDATE (last) · re-read balance
+    A->>A: minimal φ via water-filling
+    A->>DB: reduce winning positions · adl_events · adl_fills · ADL_RECOVERY ledger entry
     DB-->>A: COMMIT · balance = $0
 ```
 
-Cada cuenta con beneficio no realizado cierra **la misma fracción φ** de sus posiciones ganadoras **al precio de entrada**: el beneficio de la parte cerrada pasa al fondo y el principal nunca se toca.
+Every account with unrealized profit closes **the same fraction φ** of its winning positions **at entry price**: the profit on the closed slice goes to the fund, and principal is never touched.
 
 ```
-Σ_a min(φ, φmax_a) · U_a = S          S = déficit, U_a = beneficio no realizado de la cuenta a
-φmax_a = (E_a − h·MM_a) / (U_a − h·MMw_a)     tope para que una cuenta cubierta conserve health ≥ h (1.10)
+Σ_a min(φ, φmax_a) · U_a = S          S = shortfall, U_a = unrealized profit of account a
+φmax_a = (E_a − h·MM_a) / (U_a − h·MMw_a)     cap that keeps a hedged account at health ≥ h (1.10)
 ```
 
-- **Justo**: misma φ para todos, independiente del orden de procesamiento.
-- **Sin cascadas**: el tope `φmax` impide que el ADL deje liquidable a una cuenta con piernas perdedoras.
-- **Exacto y acotado**: `Σ min(φ, φmax)·U` es lineal a trozos, se resuelve ordenando los topes (sin bisección); lo recuperado nunca supera el beneficio total.
-- **Concurrencia**: `SKIP LOCKED` en vez de esperar a cuentas que están operando; si queda residual (`PARTIAL`) se reintenta en ciclos posteriores. Sin contrapartes (`NO_COUNTERPARTIES`) también queda auditado.
+- **Fair**: the same φ for everyone, independent of processing order.
+- **No induced cascades**: the `φmax` cap prevents ADL from making an account with losing legs liquidatable.
+- **Exact and bounded**: `Σ min(φ, φmax)·U` is piecewise linear and is solved by sorting the caps (no bisection); the amount recovered never exceeds total unrealized profit.
+- **Concurrency**: `SKIP LOCKED` instead of waiting on accounts that are trading; any residual (`PARTIAL`) is retried in later cycles. With no counterparties (`NO_COUNTERPARTIES`) the event is still audited.
 
-![ADL en el dashboard](RESULTADOS/07_adl_auto_deleveraging.png)
+![ADL in the dashboard](RESULTADOS/07_adl_auto_deleveraging.png)
 
-<sub>Cisne Negro con un fondo de $10: la liquidación de `whale_trader` deja un déficit de $8 461.77 que el ADL socializa entre 3 posiciones de 2 cuentas con φ = 1.1 %.</sub>
+<sub>Black Swan with a $10 fund: liquidating `whale_trader` leaves an $8,461.77 deficit that ADL socializes across 3 positions in 2 accounts with φ = 1.1%.</sub>
 
 ---
 
-## Límites de riesgo y calibración
+## Risk limits and calibration
 
-Dos capas, porque un LLM puede ignorar su prompt pero no la base de datos:
+Two layers, because an LLM can ignore its prompt but not the database:
 
-| Capa | Dónde | Qué aplica |
+| Layer | Where | What it enforces |
 |---|---|---|
-| Cliente | Guardarraíles del agente (`TradingAgent`) | Recorta sus propias decisiones a los límites de su perfil. Primera línea, no un control. |
-| **Servidor** | `OrderGateway`, bajo el lock de la cuenta y en la misma transacción que la orden | `max_leverage` (bruto / equity) y `max_gross_notional_usd` de `users_collateral`. Las órdenes que reducen exposición nunca se bloquean. |
+| Client | Agent guardrails (`TradingAgent`) | Clips the agent's own decisions to its profile's limits. A first line, not a control. |
+| **Server** | `OrderGateway`, under the account lock and in the same transaction as the order | `max_leverage` (gross / equity) and `max_gross_notional_usd` from `users_collateral`. Risk-reducing orders are never blocked. |
 
-| Agente | Colateral | Apalancamiento máx. | Nocional bruto máx. |
+| Agent | Collateral | Max leverage | Max gross notional |
 |---|---:|---:|---:|
 | `whale_trader` | $10k | 20x | $250k |
 | `arbitrageur` | $100k | 3x | $400k |
-| `market_manipulator` (generador de estrés) | $5M | 3x (objetivo 2x) | $10M |
+| `market_manipulator` (stress generator) | $5M | 3x (2x target) | $10M |
 
-Recalibración sin tocar código: `--max-leverage AGENTE=X`, `--max-notional AGENTE=USD` (repetibles). Al arrancar, un **chequeo pre-flight** compara el Insurance Fund con el peor *bad debt* de todas las cuentas al máximo de sus límites ante un salto adverso del 30 % (`--stress-jump`) y avisa si la cobertura es < 1×. El dashboard publica además la **cobertura IF / Open Interest** y el **VaR/ES 99 %** (Student-t, covarianza EWMA) de la cartera agregada y de cada cuenta.
+Recalibrate without touching code: `--max-leverage AGENT=X`, `--max-notional AGENT=USD` (repeatable). At start-up, a **pre-flight check** compares the Insurance Fund with the worst-case bad debt of every account at its limits under a 30% adverse jump (`--stress-jump`) and warns if coverage is below 1×. The dashboard also publishes **Insurance Fund / Open Interest coverage** and **99% VaR/ES** (Student-t, EWMA covariance) for the aggregate portfolio and for each account.
 
-### Postmortem: −$334k en una liquidación
+### Postmortem: −$334k from a single liquidation
 
 | | |
 |---|---|
-| **Impacto** | Una sola liquidación del corto de `market_manipulator` (~$17M de nocional, ~15.5x efectivo) generó un déficit de **$334k**: el Insurance Fund de $100k quedó en **−$234k** y el sistema solo mostró una alerta. |
-| **Causa raíz 1** | Al terminar el Cisne Negro con `--live`, el precio sombra saltaba en **un tick** del nivel crasheado al real (+20-30 %), atravesando el precio de bancarrota del corto. |
-| **Causa raíz 2** | El único freno de exposición era el guardarraíl del propio agente: 5x sobre $5M sin tope absoluto y piramidando sobre beneficio no realizado. La cobertura de estrés era **0.04×**. |
-| **Causa raíz 3** | Fondo en negativo = alerta pasiva; el déficit no se socializaba. |
-| **Correcciones** | `ReconvergingSource` (sin gaps) · límites server-side + recalibración (cobertura 0.04× → 2.0×) · chequeo pre-flight · **ADL** real y auditado · las ráfagas de estrés se dimensionan con el *headroom* de la cuenta y se abortan al primer rechazo. |
-| **Regresión** | `test_orchestrator_returns_to_live_without_gap`, `test_stress_coverage_flags_the_incident_calibration`, `test_liquidation_that_depletes_the_fund_triggers_adl_in_the_same_cycle`, `test_orchestrator_black_swan_with_thin_fund_runs_adl`. |
+| **Impact** | A single liquidation of the `market_manipulator` short (~$17M notional, ~15.5x effective leverage) produced a **$334k** deficit: the $100k Insurance Fund ended at **−$234k** and the system only raised an alert. |
+| **Root cause 1** | When the Black Swan ended in `--live` mode, the shadow price jumped in **one tick** from the crashed level to the real one (+20-30%), straight through the short's bankruptcy price. |
+| **Root cause 2** | The only exposure brake was the agent's own guardrail: 5x on $5M with no absolute cap, pyramiding on unrealized profit. Stress coverage was **0.04×**. |
+| **Root cause 3** | A negative fund was a passive alert; the deficit was never socialized. |
+| **Fixes** | `ReconvergingSource` (no gaps) · server-side limits + recalibration (coverage 0.04× → 2.0×) · pre-flight check · a real, audited **ADL** · stress bursts are sized to the account's headroom and aborted on the first rejection. |
+| **Regression tests** | `test_orchestrator_returns_to_live_without_gap`, `test_stress_coverage_flags_the_incident_calibration`, `test_liquidation_that_depletes_the_fund_triggers_adl_in_the_same_cycle`, `test_orchestrator_black_swan_with_thin_fund_runs_adl`. |
 
 ---
 
-## Arranque rápido
+## Quick start
 
-### Opción A · Desarrollo local (PostgreSQL en Docker)
+### Option A · Local development (PostgreSQL in Docker)
 
 ```bash
-cp .env.example .env                                   # define POSTGRES_PASSWORD
-docker compose up -d                                   # PostgreSQL 15 con esquema y migraciones
+cp .env.example .env                                   # set POSTGRES_PASSWORD
+docker compose up -d                                   # PostgreSQL 15 with schema and migrations
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dashboard.txt
-python -m database.migrate                             # idempotente
+python -m database.migrate                             # idempotent
 
-# Terminal 1 · orquestador (sin OPENAI_API_KEY usa la política determinista)
+# Terminal 1 · orchestrator (without OPENAI_API_KEY it uses the deterministic policy)
 python -m ai_agents.orchestrator --insurance-fund 100000 --black-swan-at 60
 
 # Terminal 2 · dashboard → http://localhost:8501
 streamlit run dashboard/app.py
 ```
 
-Con `OPENAI_API_KEY` los agentes deciden con un LLM (salida estructurada Pydantic); si el proveedor falla tres veces seguidas, un circuit breaker los pasa a reglas durante 60 s. `--live` usa precios en vivo de Hyperliquid Testnet; `--crash-steps 1` reproduce un gap instantáneo.
+With `OPENAI_API_KEY` set, agents decide through an LLM (Pydantic structured output); if the provider fails three times in a row, a circuit breaker switches them to rules for 60 s. `--live` uses live Hyperliquid Testnet prices; `--crash-steps 1` reproduces an instantaneous gap.
 
-### Opción B · Stack completo en contenedores
+### Option B · Full containerized stack
 
 ```bash
 cd deployment
-cp .env.production.example .env.production             # rellena los secretos (el entrypoint rechaza "change_me")
+cp .env.production.example .env.production             # fill in secrets (the entrypoint rejects "change_me")
 docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
 # postgres → migrate (one-shot) → orchestrator + dashboard (127.0.0.1:8501) + log-shipper → S3
 ```
 
-Producción en AWS (EC2 sin puertos de entrada, acceso por SSM, secretos en Parameter Store, S3 con KMS e IAM de mínimo privilegio): [`deployment/README.md`](deployment/README.md).
+Production on AWS (EC2 with no inbound ports, SSM access, secrets in Parameter Store, KMS-encrypted S3 and least-privilege IAM): [`deployment/README.md`](deployment/README.md).
 
 ### Tests
 
 ```bash
 pip install -r requirements-dev.txt
-TEST_POSTGRES_HOST=127.0.0.1 TEST_POSTGRES_PASSWORD=… pytest      # 135 tests; sin PostgreSQL, los de integración se omiten
+TEST_POSTGRES_HOST=127.0.0.1 TEST_POSTGRES_PASSWORD=… pytest      # 135 tests; integration tests are skipped without PostgreSQL
 ```
 
-Cubren la matemática (margen, VaR/ES, GARCH, Monte Carlo, ADL), la concurrencia real contra PostgreSQL (locks, `SKIP LOCKED`, exactly-once de la cola de comandos, triggers append-only), la simulación de extremo a extremo y la app Streamlit.
+They cover the maths (margin, VaR/ES, GARCH, Monte Carlo, ADL), real concurrency against PostgreSQL (locks, `SKIP LOCKED`, exactly-once command queue, append-only triggers), the end-to-end simulation and the Streamlit app.
 
 ---
 
-## Resultados
+## Results
 
 | | |
 |---|---|
-| ![Insurance Fund](RESULTADOS/01_insurance_fund_ledger.png) | ![Cuentas](RESULTADOS/02_cuentas_health_ratio.png) |
-| **Insurance Fund**: libro mayor inmutable, cada movimiento enlazado a su liquidación. | **Cuentas**: health ratio en tiempo real con la misma fórmula que el motor. |
-| ![Liquidaciones](RESULTADOS/03_liquidaciones_deficit_slippage.png) | ![Mercado](RESULTADOS/04_mercado_mark_oracle.png) |
-| **Liquidaciones**: déficit por régimen y distribución del slippage. | **Mercado**: mark, oracle, basis y liquidez del libro sombra. |
-| ![Antes del ADL](RESULTADOS/05_insurance_fund_negativo_sin_adl.png) | ![Después: ADL](RESULTADOS/07_adl_auto_deleveraging.png) |
-| **Antes**: el incidente; fondo en −$234k y solo una alerta. | **Después**: el déficit se socializa con ADL y el fondo vuelve a $0. |
+| ![Insurance Fund](RESULTADOS/01_insurance_fund_ledger.png) | ![Accounts](RESULTADOS/02_cuentas_health_ratio.png) |
+| **Insurance Fund**: immutable ledger, every entry linked to its liquidation. | **Accounts**: real-time health ratio using the same formula as the engine. |
+| ![Liquidations](RESULTADOS/03_liquidaciones_deficit_slippage.png) | ![Market](RESULTADOS/04_mercado_mark_oracle.png) |
+| **Liquidations**: deficit by regime and slippage distribution. | **Market**: mark, oracle, basis and liquidity of the shadow book. |
+| ![Before ADL](RESULTADOS/05_insurance_fund_negativo_sin_adl.png) | ![After: ADL](RESULTADOS/07_adl_auto_deleveraging.png) |
+| **Before**: the incident; fund at −$234k and only an alert. | **After**: the deficit is socialized by ADL and the fund returns to $0. |
 
 ---
 
-## Seguridad
+## Security
 
-- Ningún secreto en el repositorio ni en su historial: `.env`, `Claves.txt`, `*.pem`, `*.key` y `credentials*.json` están en `.gitignore`; las imágenes Docker excluyen además capturas y vídeos (`.dockerignore`).
-- El entrypoint rechaza secretos de plantilla (`change_me`, `<SSM:…>`) y exige contraseña de operador para el dashboard en producción (comparación en tiempo constante).
-- Mainnet bloqueado por defecto; la clave privada nunca aparece en `repr` ni en logs; el generador de estrés tiene prohibido por código cualquier enrutamiento externo.
-- PostgreSQL solo en loopback; dashboard detrás de un port-forward de SSM.
+- No secrets in the repository or its history: `.env`, `Claves.txt`, `*.pem`, `*.key` and `credentials*.json` are git-ignored; Docker images also exclude screenshots and videos (`.dockerignore`).
+- The entrypoint rejects template secrets (`change_me`, `<SSM:…>`) and requires an operator password for the dashboard in production (constant-time comparison).
+- Mainnet is blocked by default; the private key never appears in `repr` or logs; the stress generator is barred in code from any external order routing.
+- PostgreSQL listens on loopback only; the dashboard sits behind an SSM port-forward.
 
-<sub>Proyecto personal de Carlos Martín López. Simulación con fines de investigación en riesgo: el agente «manipulador» es un generador de estrés sintético contra un libro sombra, nunca contra un mercado real.</sub>
+<sub>Personal project by Carlos Martín López. A risk-research simulation: the "manipulator" agent is a synthetic stress generator trading against a shadow book, never against a real market.</sub>
