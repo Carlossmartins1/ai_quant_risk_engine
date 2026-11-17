@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Mapping, Protocol
 
 import numpy as np
@@ -43,6 +43,7 @@ __all__ = [
     "PriceSource",
     "MonteCarloPathSource",
     "LiveFeedSource",
+    "ReconvergingSource",
     "ShadowMarketConfig",
     "ShadowMarket",
     "FlowResult",
@@ -134,6 +135,67 @@ class LiveFeedSource:
             quotes[sym] = BaseQuote(sym, snap.ctx.mark_price, snap.ctx.oracle_price, 1.0, snap.book,
                                     snap.ctx.funding_rate_hourly)
         return quotes
+
+
+class ReconvergingSource:
+    """
+    Transición sin gaps de un régimen simulado (Monte Carlo de estrés) a la fuente en vivo.
+
+    Al terminar un Cisne Negro con ``--live``, el precio sombra está en el nivel "crasheado" y el feed
+    real no: conmutar directamente produce un salto instantáneo (+20-30 %) que atraviesa el precio de
+    bancarrota de cualquier corto grande y genera déficits artificiales (incidente del manipulador:
+    −$334k). Aquí el precio publicado es ``live · exp(offset_t)`` con
+    ``offset_0 = ln(precio_sombra / precio_live)`` y decaimiento geométrico por tick:
+    ``offset_t = offset_0 · 0.5^(t / half_life_ticks)``. El oracle y el libro L2 se desplazan igual
+    (si solo se moviera el mark, el basis mark−oracle reintroduciría medio gap). Cuando todos los
+    offsets caen por debajo de ``tolerance`` la fuente es transparente.
+    """
+
+    def __init__(self, inner: PriceSource, start_prices: Mapping[str, float], *,
+                 half_life_ticks: float = 12.0, tolerance: float = 1e-4) -> None:
+        if half_life_ticks <= 0:
+            raise ValueError("half_life_ticks debe ser > 0")
+        self.inner = inner
+        self.name = f"{inner.name}(reconverging)"
+        self._start = {s: float(p) for s, p in start_prices.items() if p and p > 0}
+        self._decay = 0.5 ** (1.0 / half_life_ticks)
+        self._tolerance = tolerance
+        self._offsets: dict[str, float] | None = None
+
+    @property
+    def converged(self) -> bool:
+        return self._offsets is not None and all(abs(o) < self._tolerance for o in self._offsets.values())
+
+    def offset(self, symbol: str) -> float:
+        return 0.0 if self._offsets is None else self._offsets.get(symbol, 0.0)
+
+    @staticmethod
+    def _scaled_book(book: L2BookSnapshot, k: float) -> L2BookSnapshot:
+        bids, asks = book.bids.copy(), book.asks.copy()
+        bids[:, 0] *= k
+        asks[:, 0] *= k
+        bids.flags.writeable = False
+        asks.flags.writeable = False
+        return replace(book, bids=bids, asks=asks)
+
+    def next_quotes(self) -> dict[str, BaseQuote] | None:
+        quotes = self.inner.next_quotes()
+        if not quotes:
+            return quotes
+        if self._offsets is None:  # el offset se fija con la PRIMERA cotización real tras la conmutación
+            self._offsets = {s: math.log(self._start[s] / q.price)
+                             for s, q in quotes.items() if s in self._start and q.price > 0}
+        out: dict[str, BaseQuote] = {}
+        for sym, q in quotes.items():
+            off = self._offsets.get(sym, 0.0)
+            if abs(off) < self._tolerance:
+                out[sym] = q
+                continue
+            k = math.exp(off)
+            out[sym] = replace(q, price=q.price * k, oracle=q.oracle * k,
+                               book=None if q.book is None else self._scaled_book(q.book, k))
+        self._offsets = {s: o * self._decay for s, o in self._offsets.items()}
+        return out
 
 
 # =============================================================================

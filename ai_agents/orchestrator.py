@@ -47,7 +47,14 @@ import structlog
 
 from ai_agents.control_plane import ControlPlane, SimulationCommand
 from ai_agents.order_gateway import GatewayConfig, OrderGateway
-from ai_agents.shadow_market import LiveFeedSource, MonteCarloPathSource, PriceSource, ShadowMarket, ShadowMarketConfig
+from ai_agents.shadow_market import (
+    LiveFeedSource,
+    MonteCarloPathSource,
+    PriceSource,
+    ReconvergingSource,
+    ShadowMarket,
+    ShadowMarketConfig,
+)
 from ai_agents.trader_agents import (
     AccountView,
     AgentAction,
@@ -86,6 +93,7 @@ class OrchestratorConfig:
     stress_path_quantile: float = 0.05     # trayectoria del percentil 5 de BTC (escenario de cola)
     stress_vol_multiplier: float = 1.0
     stress_crash_steps: int = 18           # ticks del shock forzado (18 => BTC ≈ −1.1 %/tick; 1 = gap instantáneo)
+    reconverge_half_life_ticks: float = 12.0  # vuelta al precio en vivo tras el estrés (12 => ~1.2 %/tick de un gap del 22 %)
     normal_paths: int = 256
     seed: int | None = None
     initial_prices: Mapping[str, float] = field(default_factory=lambda: {"BTC": 95_000.0, "ETH": 3_500.0})
@@ -300,7 +308,12 @@ class Orchestrator:
                 cfg = cfg.with_volatility(self.stress_annual_vols, multiplier=self.cfg.stress_vol_multiplier)
             self._source = MonteCarloPathSource.from_config(cfg, quantile=self.cfg.stress_path_quantile)
         elif self.live_source is not None:
-            self._source = self.live_source
+            if self._mode is MarketMode.BLACK_SWAN and any(self._history.values()):
+                # Volver del estrés al feed real sin gap: el precio sombra reconverge al live por ticks
+                self._source = ReconvergingSource(self.live_source, prices,
+                                                  half_life_ticks=self.cfg.reconverge_half_life_ticks)
+            else:
+                self._source = self.live_source
         else:
             cfg = ScenarioConfig.normal(n_paths=self.cfg.normal_paths, seed=self._next_seed()).with_prices(prices)
             self._source = MonteCarloPathSource.from_config(cfg, quantile=0.5)
@@ -512,6 +525,8 @@ def main() -> None:  # pragma: no cover - punto de entrada interactivo
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--crash-steps", type=int, default=OrchestratorConfig.stress_crash_steps,
                         help="ticks en los que se reparte el shock del Cisne Negro (1 = gap instantáneo)")
+    parser.add_argument("--reconverge-ticks", type=float, default=OrchestratorConfig.reconverge_half_life_ticks,
+                        help="semivida (ticks) de la vuelta al precio en vivo tras un Cisne Negro con --live")
     parser.add_argument("--live", action="store_true", help="precios base en vivo de Hyperliquid Testnet")
     parser.add_argument("--insurance-fund", type=float, default=None, help="capitaliza el fondo antes de empezar")
     parser.add_argument("--csv", type=str, default=None, help="prefijo para exportar timeline/liquidaciones")
@@ -540,7 +555,7 @@ def main() -> None:  # pragma: no cover - punto de entrada interactivo
             raise SystemExit("Sin datos del feed de Hyperliquid en 20 s")
 
     cfg = OrchestratorConfig(tick_interval_s=args.tick, black_swan_after_s=args.black_swan_at, seed=args.seed,
-                             stress_crash_steps=args.crash_steps)
+                             stress_crash_steps=args.crash_steps, reconverge_half_life_ticks=args.reconverge_ticks)
     agents = default_agents(whale_bias=args.whale_bias, use_llm=False if args.no_llm else None)
     orch = Orchestrator(db, config=cfg, agents=agents, live_store=feed.store if feed else None)
     for sig in (signal.SIGTERM, signal.SIGINT):  # parada ordenada en `docker stop` / Ctrl-C

@@ -14,7 +14,7 @@ from langchain_core.runnables import RunnableLambda
 
 from ai_agents.order_gateway import OrderGateway
 from ai_agents.orchestrator import Orchestrator, OrchestratorConfig
-from ai_agents.shadow_market import BaseQuote, MonteCarloPathSource, ShadowMarket
+from ai_agents.shadow_market import BaseQuote, MonteCarloPathSource, ReconvergingSource, ShadowMarket
 from ai_agents.trader_agents import (
     AccountView,
     AgentPersona,
@@ -29,7 +29,7 @@ from ai_agents.trader_agents import (
     TradingAgent,
 )
 from quant_models.monte_carlo import ScenarioConfig
-from tests.helpers import seed_account, seed_insurance_fund
+from tests.helpers import make_store, seed_account, seed_insurance_fund
 
 MARKS = {"BTC": 95_000.0, "ETH": 3_500.0}
 
@@ -270,3 +270,53 @@ def test_orchestrator_black_swan_cascade_hits_insurance_fund(clean_db):
     with clean_db.transaction(readonly=True) as cur:
         cur.execute("SELECT count(*) AS n FROM liquidation_events WHERE market_regime = 'STRESS_MONTE_CARLO'")
         assert cur.fetchone()["n"] >= 1
+
+
+# ============================================================================= reconvergencia post-estrés
+class _ConstantSource:
+    name = "live:test"
+
+    def __init__(self, prices):
+        self.prices = prices
+
+    def next_quotes(self):
+        return {s: BaseQuote(s, p, p) for s, p in self.prices.items()}
+
+
+def test_reconverging_source_removes_the_gap():
+    """Tras un crash simulado (BTC 74 000) el feed real está en 95 000: sin gap, convergencia geométrica."""
+    src = ReconvergingSource(_ConstantSource({"BTC": 95_000.0, "ETH": 3_500.0}), {"BTC": 74_000.0, "ETH": 2_700.0},
+                             half_life_ticks=12)
+    path = [src.next_quotes()["BTC"].price for _ in range(200)]
+    assert path[0] == pytest.approx(74_000)                          # primer tick: continuidad exacta
+    assert path[12] == pytest.approx(95_000 * (74_000 / 95_000) ** 0.5, rel=1e-9)  # semivida en log-precio
+    steps = np.diff(np.log(path))
+    assert np.all(steps >= 0) and np.all(steps[:100] > 0)           # monótono hasta converger
+    assert steps.max() < 0.025                                      # sin saltos (> 2.5 %/tick)
+    assert src.converged and path[-1] == 95_000.0                    # transparente al converger
+    eth = src.next_quotes()["ETH"]
+    assert eth.oracle == eth.price                                   # oracle desplazado igual que el precio
+
+
+def test_reconverging_source_scales_live_book():
+    store = make_store({"BTC": {"mark": 100.0, "bids": [(99.0, 1.0)], "asks": [(101.0, 1.0)]}})
+    from ai_agents.shadow_market import LiveFeedSource
+
+    q = ReconvergingSource(LiveFeedSource(store), {"BTC": 80.0}).next_quotes()["BTC"]
+    assert q.price == pytest.approx(80.0) and q.book.best_bid == pytest.approx(99.0 * 0.8)
+    assert not q.book.bids.flags.writeable
+
+
+def test_orchestrator_returns_to_live_without_gap():
+    """Regresión del incidente −$334k: fin de Cisne Negro con --live ya no salta al precio real."""
+    store = make_store({"BTC": {"mark": 95_000.0}, "ETH": {"mark": 3_500.0}})
+    orch = Orchestrator(None, config=OrchestratorConfig(control_interval_s=None), agents=[], live_store=store)
+    orch._history["BTC"].append(74_000.0)
+    orch._history["ETH"].append(2_700.0)
+    orch._mode = MarketMode.BLACK_SWAN
+    orch._switch_mode(MarketMode.NORMAL)
+    assert isinstance(orch._source, ReconvergingSource)
+    assert orch._source.next_quotes()["BTC"].price == pytest.approx(74_000)
+    fresh = Orchestrator(None, config=OrchestratorConfig(control_interval_s=None), agents=[], live_store=store)
+    fresh._switch_mode(MarketMode.NORMAL)                            # arranque: sin estrés previo => live directo
+    assert fresh._source.name == "live:hyperliquid"
