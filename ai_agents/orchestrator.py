@@ -66,6 +66,7 @@ from ai_agents.trader_agents import (
 )
 from database.connection import DatabaseManager, lock_account
 from quant_models.monte_carlo import ScenarioConfig
+from quant_models.var_es import ewma_var_es
 from risk_engine.adl import AdlOutcome
 from risk_engine.liquidation_executor import (
     LiquidationConfig,
@@ -106,6 +107,8 @@ class OrchestratorConfig:
     llm_workers: int = 3
     control_interval_s: float | None = 1.0  # plano de control (dashboard); None = desactivado
     stress_jump: float = 0.30              # salto adverso del chequeo pre-flight de cobertura del Insurance Fund
+    risk_alpha: float = 0.99               # VaR/ES publicado al dashboard
+    risk_horizon_ticks: int = 12           # 12 ticks = 1 h simulada en Monte Carlo (pasos de 5 min)
 
 
 @dataclass(frozen=True)
@@ -391,8 +394,43 @@ class Orchestrator:
              "fund_balance": self._fund_balance, "source": getattr(self._source, "name", None),
              "adl_events": n_adl, "adl_recovered_usd": round(adl_recovered, 2),
              "stress_coverage": None if self.coverage is None else self.coverage.as_dict(),
+             "risk": self._portfolio_risk(),
              "agents": {name: uid for name, uid in self._user_ids.items()}},
         )
+
+    def _portfolio_risk(self) -> dict[str, Any] | None:
+        """
+        VaR/ES (Student-t, covarianza EWMA de los marks del shadow market) de la cartera agregada de
+        los agentes y de cada cuenta, más el Open Interest (Σ|q|·mark). Lo consume el dashboard.
+        """
+        try:
+            snap = self.calculator.snapshot()
+            symbols = sorted(self._history)
+            n = min((len(self._history[s]) for s in symbols), default=0)
+            prices = np.column_stack([np.asarray(self._history[s], dtype=np.float64)[-n:] for s in symbols]) if n else None
+            pos = snap.positions
+            oi = float(np.nansum(pos["notional"])) if not pos.empty else 0.0
+            out: dict[str, Any] = {"alpha": self.cfg.risk_alpha, "horizon_ticks": self.cfg.risk_horizon_ticks,
+                                   "method": "parametric_t_ewma", "open_interest": round(oi, 2),
+                                   "observations": max(n - 1, 0), "var": None, "es": None, "by_account": {}}
+            if prices is None or pos.empty:
+                return out
+            names = {uid: name for name, uid in self._user_ids.items()}
+            expo = (pos.assign(e=pos["quantity"] * pos["mark_price"])
+                    .pivot_table(index="user_id", columns="symbol", values="e", aggfunc="sum", fill_value=0.0)
+                    .reindex(columns=symbols, fill_value=0.0))
+            E = np.vstack([expo.to_numpy().sum(axis=0), expo.to_numpy()])
+            est = ewma_var_es(prices, E, alpha=self.cfg.risk_alpha, horizon=self.cfg.risk_horizon_ticks)
+            if est is None:
+                return out
+            var, es = np.atleast_1d(est.var), np.atleast_1d(est.es)
+            out.update(var=round(float(var[0]), 2), es=round(float(es[0]), 2),
+                       by_account={names.get(int(uid), str(uid)): {"var": round(float(v), 2), "es": round(float(e), 2)}
+                                   for uid, v, e in zip(expo.index, var[1:], es[1:])})
+            return out
+        except Exception:  # noqa: BLE001 - un fallo de la métrica nunca tumba el plano de control
+            log.exception("orchestrator.portfolio_risk_error")
+            return None
 
     # ------------------------------------------------------------------ risk
     def _risk_tick(self) -> None:

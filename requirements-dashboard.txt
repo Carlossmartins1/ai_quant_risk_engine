@@ -2,7 +2,7 @@
 #  Dashboard Streamlit (imagen "dashboard"): solo lo necesario para leer PostgreSQL,
 #  recalcular márgenes (risk_engine.margin_calculator) y renderizar. Sin LangChain/SDKs.
 # =============================================================================
-streamlit>=1.45,<2
+streamlit>=1.67,<2
 altair>=5.4,<7
 numpy>=1.26,<3
 pandas>=2.2,<4

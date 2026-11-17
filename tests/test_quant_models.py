@@ -363,3 +363,20 @@ def test_simulation_performance():
     res = JumpDiffusionSimulator(cfg).run()
     assert time.perf_counter() - t0 < 5.0 and res.prices.shape == (10_000, 289, 2)
     assert np.all(np.isfinite(res.prices)) and np.all(res.prices > 0)
+
+
+def test_ewma_var_es_realtime_panel():
+    """VaR/ES del panel: t-Student + EWMA desde precios; None con historia insuficiente."""
+    from quant_models.var_es import ewma_var_es, parametric_var_es, ewma_covariance
+
+    rng = np.random.default_rng(3)
+    r = rng.normal(0, [0.002, 0.003], size=(200, 2))
+    prices = np.vstack([[95_000.0, 3_500.0], [95_000.0, 3_500.0] * np.exp(np.cumsum(r, axis=0))])
+    E = np.array([[1e6, -5e5], [2e5, 0.0]])
+    est = ewma_var_es(prices, E, alpha=0.99, horizon=12)
+    cov = ewma_covariance(np.diff(np.log(prices), axis=0))
+    ref = parametric_var_es(E, cov, alpha=0.99, horizon=12, dist="t", nu=4)
+    assert np.allclose(est.var, ref.var) and np.all(est.es > est.var) and est.method.value == "parametric_t"
+    assert ewma_var_es(prices[:20], E) is None
+    with pytest.raises(ValueError):
+        ewma_var_es(prices[:, 0], E)

@@ -6,10 +6,12 @@ Centro de control en tiempo real del AI-Driven Quant Risk & Liquidation Engine (
 
 Paneles
 -------
-* **KPIs**: balance del Insurance Fund, déficit absorbido, comisiones, liquidaciones, cuentas en riesgo.
+* **KPIs**: Insurance Fund, cobertura del fondo frente al Open Interest, VaR/ES 99 % de la cartera agregada,
+  liquidaciones, Auto-Deleveraging y cuentas en riesgo.
 * **Insurance Fund**: evolución del balance (libro mayor) y movimientos.
-* **Cuentas**: health ratio en tiempo real de cada cuenta (misma fórmula que el motor de riesgo).
+* **Cuentas**: health ratio en tiempo real de cada cuenta (misma fórmula que el motor de riesgo) y VaR/ES por cuenta.
 * **Liquidaciones**: histórico con déficit, slippage y régimen de mercado.
+* **ADL**: ejecuciones de Auto-Deleveraging (déficit, recuperado, φ) y posiciones desapalancadas.
 * **Mercado**: mark / oracle / basis / liquidez publicados por el orquestador.
 * **Control**: Modo Normal ↔ Cisne Negro y recapitalización de agentes vía la cola ``simulation_commands``
   (plano de control en PostgreSQL).
@@ -41,7 +43,14 @@ if str(ROOT) not in sys.path:  # `streamlit run dashboard/app.py` desde la raíz
     sys.path.insert(0, str(ROOT))
 
 from ai_agents.control_plane import SimulationCommand  # noqa: E402
-from dashboard.data import HEALTH_WARNING, DashboardRepository, fmt_usd  # noqa: E402
+from dashboard.data import (  # noqa: E402
+    HEALTH_WARNING,
+    DashboardRepository,
+    RiskOverview,
+    fmt_short,
+    fmt_usd,
+    risk_overview,
+)
 from database.connection import DatabaseManager, DBConfig  # noqa: E402
 
 # -----------------------------------------------------------------------------
@@ -50,9 +59,12 @@ from database.connection import DatabaseManager, DBConfig  # noqa: E402
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]          # slots 1-4
 STATUS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b", "neutral": "#898781"}
 INK_MUTED = "#898781"
-LEDGER_COLORS = alt.Scale(
-    domain=["CAPITAL_INJECTION", "LIQUIDATION_FEE", "BANKRUPTCY_DEFICIT", "ADJUSTMENT"], range=SERIES,
+SERIES_5 = "#e87ba4"                                           # slot 5 (magenta), solo para ADL_RECOVERY
+LEDGER_COLORS = alt.Scale(  # el color sigue a la entidad: los 4 tipos históricos conservan su slot
+    domain=["CAPITAL_INJECTION", "LIQUIDATION_FEE", "BANKRUPTCY_DEFICIT", "ADJUSTMENT", "ADL_RECOVERY"],
+    range=[*SERIES, SERIES_5],
 )
+ADL_STATUS_COLORS = alt.Scale(domain=["Recuperado", "Residual"], range=[STATUS["good"], STATUS["critical"]])
 REGIME_COLORS = alt.Scale(domain=["LIVE_TESTNET", "STRESS_MONTE_CARLO"], range=SERIES[:2])
 STATUS_COLORS = alt.Scale(
     domain=["Sana", "En riesgo", "Liquidable", "Sin precio"],
@@ -229,30 +241,75 @@ def slippage_chart(liq: pd.DataFrame) -> alt.Chart:
     ).properties(height=260)
 
 
+def adl_chart(adl: pd.DataFrame) -> alt.Chart:
+    """Déficit de cada ADL partido en recuperado (ganadores) y residual (sin socializar): barras apiladas."""
+    data = adl.melt(id_vars=["created_at", "adl_event_id", "phi", "status", "liquidated_agent"],
+                    value_vars=["recovered", "residual_shortfall"], var_name="part", value_name="usd")
+    data["part"] = data["part"].map({"recovered": "Recuperado", "residual_shortfall": "Residual"})
+    data["label"] = "#" + data["adl_event_id"].astype(str)
+    return alt.Chart(data).mark_bar(cornerRadiusEnd=4, size=16, stroke="#fcfcfb", strokeWidth=2).encode(
+        x=alt.X("label:N", title="Evento ADL", sort=alt.SortField("adl_event_id"), axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("sum(usd):Q", title="Déficit (USD)", axis=alt.Axis(format="$,.0f"), stack="zero"),
+        color=alt.Color("part:N", scale=ADL_STATUS_COLORS, title=None, legend=alt.Legend(orient="top")),
+        order=alt.Order("part:N", sort="ascending"),
+        tooltip=[alt.Tooltip("label:N", title="Evento"), alt.Tooltip("created_at:T", title="Fecha", format="%H:%M:%S"),
+                 alt.Tooltip("part:N", title="Parte"), alt.Tooltip("usd:Q", title="Importe", format="$,.2f"),
+                 alt.Tooltip("phi:Q", title="φ (fracción recortada)", format=".2%"),
+                 alt.Tooltip("liquidated_agent:N", title="Liquidación origen"), alt.Tooltip("status:N", title="Estado")],
+    ).properties(height=240)
+
+
 # -----------------------------------------------------------------------------
 # Paneles en vivo
 # -----------------------------------------------------------------------------
-def render_kpis(repo: DashboardRepository, ledger: pd.DataFrame, accounts: pd.DataFrame) -> None:
+def render_kpis(repo: DashboardRepository, ledger: pd.DataFrame, accounts: pd.DataFrame, risk: RiskOverview) -> None:
     fund = repo.fund_overview()
     at_risk = int(accounts["status"].isin(["🔴 Liquidable", "🟠 En riesgo"]).sum()) if not accounts.empty else 0
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     spark = ledger["balance_after"].tail(60).tolist() if len(ledger) > 1 else None
-    c1.metric("Insurance Fund", fmt_usd(fund.balance, compact=True), delta=f"{fund.net_pnl:+,.2f} USD neto",
+    c1.metric("Insurance Fund", fmt_short(fund.balance), delta=f"{fund.net_pnl:+,.0f} USD neto",
               delta_color="normal", border=True, chart_data=spark, chart_type="area",
-              help="Delta = comisiones cobradas − déficits absorbidos (excluye capitalizaciones)")
-    c2.metric("Déficit absorbido", fmt_usd(fund.deficits_absorbed, compact=True), border=True)
-    c3.metric("Comisiones de liquidación", fmt_usd(fund.fees_collected, compact=True), border=True)
+              help="Delta = comisiones + recuperado por ADL − déficits absorbidos (excluye capitalizaciones)")
+    cov = risk.coverage_ratio
+    c2.metric("Cobertura IF / OI", "—" if cov is None else f"{cov:.2%}", border=True,
+              delta=None if risk.open_interest <= 0 else f"OI {fmt_short(risk.open_interest)}",
+              delta_color="off", delta_arrow="off",
+              help="Insurance Fund / Open Interest (Σ|q|·mark de las cuentas activas). Los exchanges lo vigilan "
+                   "como % del OI: por debajo, una liquidación grande con gap puede agotar el fondo.")
+    if risk.var is not None and risk.es is not None:
+        hz = f"{risk.horizon_ticks} ticks" if risk.horizon_ticks else "1 tick"
+        cover = risk.fund_to_es
+        c3.metric(f"VaR {risk.alpha:.0%} cartera", fmt_short(risk.var), delta=f"ES {fmt_short(risk.es)}",
+                  delta_color="off", delta_arrow="off", border=True,
+                  help=f"Cartera agregada de los agentes, horizonte {hz} (1 tick = 5 min simulados). Student-t "
+                       "(ν=4) con covarianza EWMA (λ=0.94) de los marks del shadow market. ES = pérdida media en el "
+                       f"1 % peor de los escenarios. El fondo cubre {cover:.2f}× el ES." if cover is not None else
+                       f"Cartera agregada de los agentes, horizonte {hz}. Student-t (ν=4) + EWMA (λ=0.94).")
+    else:
+        c3.metric("VaR 99% cartera", "—", border=True, help="Disponible con el orquestador en marcha (≥ 30 observaciones).")
     c4.metric("Liquidaciones", f"{fund.liquidations:,}", border=True,
+              delta=f"déficit {fmt_short(fund.deficits_absorbed)}" if fund.deficits_absorbed else None,
+              delta_color="off", delta_arrow="off",
               help=f"Última: {fund.last_liquidation_at:%H:%M:%S}" if fund.last_liquidation_at else None)
-    c5.metric("Cuentas en riesgo", f"{at_risk}", border=True, help=f"Health ratio ≤ {HEALTH_WARNING} o liquidables")
+    c5.metric("ADL ejecutados", f"{fund.adl_events:,}", border=True,
+              delta=f"+{fmt_short(fund.adl_recovered)} al fondo" if fund.adl_recovered else None,
+              delta_color="normal", help="Ejecuciones de Auto-Deleveraging y beneficio socializado de las posiciones ganadoras")
+    c6.metric("Cuentas en riesgo", f"{at_risk}", border=True, help=f"Health ratio ≤ {HEALTH_WARNING} o liquidables")
     if fund.balance < 0:
-        st.error("🚨 Insurance Fund agotado (balance negativo): se requiere Auto-Deleveraging (ADL).")
+        st.error(f"🚨 Insurance Fund en negativo ({fmt_usd(fund.balance)}): déficit pendiente de socializar. "
+                 "El motor ejecuta ADL pro-rata sobre las posiciones ganadoras en cada ciclo (pestaña ⚖️ ADL).")
 
 
 def render_fund_tab(ledger: pd.DataFrame) -> None:
     if ledger.empty:
         st.info("El Insurance Fund aún no tiene movimientos. Capitalízalo con `--insurance-fund` en el orquestador.")
         return
+    flows = ledger.groupby("entry_type")["amount"].sum()
+    a, b, c, d = st.columns(4)
+    a.metric("Capital aportado", fmt_usd(float(flows.get("CAPITAL_INJECTION", 0.0)), compact=True))
+    b.metric("Comisiones de liquidación", fmt_usd(float(flows.get("LIQUIDATION_FEE", 0.0)), compact=True))
+    c.metric("Déficits absorbidos", fmt_usd(-float(flows.get("BANKRUPTCY_DEFICIT", 0.0)), compact=True))
+    d.metric("Recuperado por ADL", fmt_usd(float(flows.get("ADL_RECOVERY", 0.0)), compact=True))
     st.altair_chart(fund_chart(ledger), width="stretch")
     st.dataframe(
         ledger.sort_values("entry_id", ascending=False), hide_index=True, width="stretch",
@@ -267,8 +324,13 @@ def render_fund_tab(ledger: pd.DataFrame) -> None:
     )
 
 
-def render_accounts_tab(health) -> None:  # noqa: ANN001 - AccountsHealth
-    table = health.table
+def render_accounts_tab(health, risk: RiskOverview) -> None:  # noqa: ANN001 - AccountsHealth
+    table = health.table.copy()
+    if not table.empty:
+        by = risk.var_by_account
+        table["var"] = table["agent_name"].map(lambda n: (by.get(n) or {}).get("var"))
+        table["es"] = table["agent_name"].map(lambda n: (by.get(n) or {}).get("es"))
+        table["es_to_equity"] = table["es"] / table["equity"].where(table["equity"] > 0)
     if not health.marks_live:
         st.warning("Precios no publicados por el orquestador: health ratios calculados con el último "
                    "`last_mark_price` conocido." if health.marks else "Sin precios disponibles.")
@@ -282,8 +344,8 @@ def render_accounts_tab(health) -> None:  # noqa: ANN001 - AccountsHealth
     st.dataframe(
         table, hide_index=True, width="stretch",
         column_order=["status", "agent_name", "agent_profile", "positions", "health_ratio", "margin_ratio", "equity",
-                      "maintenance_margin", "margin_buffer", "collateral", "unrealized_pnl", "effective_leverage",
-                      "gross_notional"],
+                      "maintenance_margin", "margin_buffer", "var", "es", "es_to_equity", "collateral", "unrealized_pnl",
+                      "effective_leverage", "gross_notional"],
         column_config={
             "status": "Estado", "agent_name": "Agente", "agent_profile": "Perfil", "positions": "Posiciones",
             "health_ratio": st.column_config.NumberColumn("Health (Eq/MM)", format="%.3f"),
@@ -295,6 +357,10 @@ def render_accounts_tab(health) -> None:  # noqa: ANN001 - AccountsHealth
             "unrealized_pnl": st.column_config.NumberColumn("uPnL", format="dollar"),
             "effective_leverage": st.column_config.NumberColumn("Apalanc.", format="%.1fx"),
             "gross_notional": st.column_config.NumberColumn("Nocional bruto", format="dollar"),
+            "var": st.column_config.NumberColumn("VaR 99%", format="dollar", help="Student-t + EWMA, horizonte de 12 ticks"),
+            "es": st.column_config.NumberColumn("ES 99%", format="dollar", help="Pérdida media en el 1 % peor"),
+            "es_to_equity": st.column_config.NumberColumn("ES / Equity", format="percent",
+                                                          help="> 100 %: un escenario de cola deja la cuenta en bancarrota"),
         },
     )
 
@@ -334,6 +400,57 @@ def render_liquidations_tab(liq: pd.DataFrame) -> None:
     )
 
 
+def render_adl_tab(repo: DashboardRepository) -> None:
+    adl = repo.adl_history()
+    if adl.empty:
+        st.info("Sin eventos de Auto-Deleveraging: el Insurance Fund ha cubierto todos los déficits.")
+        st.caption("Si una liquidación deja el fondo en negativo, el motor recorta pro-rata las posiciones "
+                   "ganadoras (misma fracción φ para todas, al precio de entrada) hasta reponerlo.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Déficit a socializar", fmt_usd(float(adl["shortfall"].sum()), compact=True))
+    c2.metric("Recuperado", fmt_usd(float(adl["recovered"].sum()), compact=True))
+    c3.metric("φ máxima", f"{adl['phi'].max():.2%}", help="Mayor fracción de las posiciones ganadoras cerrada en un ADL")
+    c4.metric("Residual pendiente", fmt_usd(float(adl.iloc[0]["residual_shortfall"]), compact=True),
+              help="Residual del último ADL (se reintenta en cada ciclo con las nuevas ganancias)")
+    st.altair_chart(adl_chart(adl), width="stretch")
+    st.dataframe(
+        adl, hide_index=True, width="stretch",
+        column_order=["created_at", "status", "liquidated_agent", "regime", "shortfall", "recovered",
+                      "residual_shortfall", "phi", "counterparties", "positions", "fund_balance_before",
+                      "fund_balance_after", "trigger_batch_id"],
+        column_config={
+            "created_at": st.column_config.DatetimeColumn("Fecha (UTC)", format="YYYY-MM-DD HH:mm:ss"),
+            "status": "Estado", "liquidated_agent": "Liquidación origen", "regime": "Régimen",
+            "shortfall": st.column_config.NumberColumn("Déficit", format="dollar"),
+            "recovered": st.column_config.NumberColumn("Recuperado", format="dollar"),
+            "residual_shortfall": st.column_config.NumberColumn("Residual", format="dollar"),
+            "phi": st.column_config.NumberColumn("φ", format="percent"),
+            "counterparties": st.column_config.NumberColumn("Cuentas", format="%d"),
+            "positions": st.column_config.NumberColumn("Posiciones", format="%d"),
+            "fund_balance_before": st.column_config.NumberColumn("Fondo antes", format="dollar"),
+            "fund_balance_after": st.column_config.NumberColumn("Fondo después", format="dollar"),
+            "trigger_batch_id": "Batch liquidación",
+        },
+    )
+    with st.expander("Posiciones desapalancadas"):
+        st.dataframe(
+            repo.adl_fills(), hide_index=True, width="stretch",
+            column_config={
+                "adl_event_id": st.column_config.NumberColumn("ADL", format="%d"),
+                "created_at": st.column_config.DatetimeColumn("Fecha (UTC)", format="HH:mm:ss"),
+                "agent_name": "Agente", "symbol": "Activo",
+                "quantity_before": st.column_config.NumberColumn("Cantidad previa", format="%.5f"),
+                "quantity_closed": st.column_config.NumberColumn("Cerrada", format="%.5f"),
+                "entry_price": st.column_config.NumberColumn("Entrada", format="dollar"),
+                "mark_price": st.column_config.NumberColumn("Mark", format="dollar"),
+                "unrealized_pnl_before": st.column_config.NumberColumn("uPnL previo", format="dollar"),
+                "haircut": st.column_config.NumberColumn("Transferido al fondo", format="dollar"),
+                "account_phi": st.column_config.NumberColumn("φ cuenta", format="percent"),
+            },
+        )
+
+
 def render_market_tab(state) -> None:  # noqa: ANN001 - ControlState
     market = state.market_state or {}
     if not market:
@@ -355,6 +472,12 @@ def render_market_tab(state) -> None:  # noqa: ANN001 - ControlState
     stats = state.stats or {}
     if stats:
         st.caption(f"Fuente de precios: `{stats.get('source')}` · tiempo de simulación {stats.get('elapsed_s', 0):,.0f}s")
+        cov = stats.get("stress_coverage") or {}
+        if cov:
+            ratio = cov.get("ratio")
+            st.caption(f"Chequeo pre-flight de estrés (salto adverso {cov.get('jump', 0):.0%}): peor déficit "
+                       f"{fmt_usd(cov.get('worst_deficit'), compact=True)} · cobertura del fondo "
+                       f"{'∞' if ratio is None else f'{ratio:.2f}×'}")
 
 
 def render_live(repo: DashboardRepository) -> None:
@@ -362,15 +485,19 @@ def render_live(repo: DashboardRepository) -> None:
     ledger = repo.fund_ledger()
     health = repo.accounts_health(state)
     liq = repo.liquidations()
-    render_kpis(repo, ledger, health.table)
-    t1, t2, t3, t4 = st.tabs(["🏦 Insurance Fund", "👥 Cuentas", "💥 Liquidaciones", "📈 Mercado"])
+    fund_balance = float(ledger["balance_after"].iloc[-1]) if not ledger.empty else repo.fund_overview().balance
+    risk = risk_overview(state, health.table, fund_balance)
+    render_kpis(repo, ledger, health.table, risk)
+    t1, t2, t3, t4, t5 = st.tabs(["🏦 Insurance Fund", "👥 Cuentas", "💥 Liquidaciones", "⚖️ ADL", "📈 Mercado"])
     with t1:
         render_fund_tab(ledger)
     with t2:
-        render_accounts_tab(health)
+        render_accounts_tab(health, risk)
     with t3:
         render_liquidations_tab(liq)
     with t4:
+        render_adl_tab(repo)
+    with t5:
         render_market_tab(state)
 
 

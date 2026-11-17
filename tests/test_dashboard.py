@@ -152,6 +152,9 @@ def test_repository_views(clean_db):
 
 
 def test_fmt_usd():
+    from dashboard.data import fmt_short
+
+    assert fmt_short(276_331) == "$276.3k" and fmt_short(-10_427_290) == "-$10.4M" and fmt_short(950) == "$950"
     assert fmt_usd(-1234.5) == "-$1,234.50" and fmt_usd(150_527.3, compact=True) == "$150,527"
     assert fmt_usd(None) == "—" and fmt_usd(math.nan) == "—"
 
@@ -183,8 +186,9 @@ def test_streamlit_app_renders_and_triggers_black_swan(app_env):
     at = AppTest.from_file(str(ROOT / "dashboard" / "app.py"), default_timeout=30).run()
     assert not at.exception, at.exception
     labels = {m.label for m in at.metric}
-    assert {"Insurance Fund", "Déficit absorbido", "Liquidaciones", "Mark", "Oracle"} <= labels
-    assert next(m for m in at.metric if m.label == "Déficit absorbido").value == "$1,360.00"
+    assert {"Insurance Fund", "Cobertura IF / OI", "VaR 99% cartera", "Liquidaciones", "ADL ejecutados",
+            "Mark", "Oracle"} <= labels
+    assert next(m for m in at.metric if m.label == "Déficits absorbidos").value == "$1,360.00"
 
     bs = next(b for b in at.button if b.key == "btn_black_swan")
     assert bs.disabled                                            # exige confirmación explícita
@@ -205,6 +209,60 @@ def test_streamlit_app_renders_and_triggers_black_swan(app_env):
         cur.execute("SELECT command::text AS c FROM simulation_commands ORDER BY command_id")
         assert [r["c"] for r in cur.fetchall()] == ["TRIGGER_BLACK_SWAN", "RESET_AGENTS"]
     assert at.checkbox(key="confirm_reset").value is False
+
+
+def test_risk_overview_and_adl_views(clean_db):
+    from ai_agents.control_plane import ControlState
+    from dashboard.data import risk_overview
+    from risk_engine.adl import AdlEngine
+
+    seed_insurance_fund(clean_db, 1.0)
+    with clean_db.transaction() as cur:
+        cur.execute("UPDATE insurance_fund SET balance = -5000 WHERE fund_id = 1")
+    seed_account(clean_db, "winner", "WHALE_AGGRESSIVE", 50_000, [("BTC", 1.0, 90_000, 10, 0.0125)])
+    AdlEngine(clean_db, make_store({"BTC": {"mark": 100_000.0}})).run()
+    repo = DashboardRepository(clean_db)
+
+    adl = repo.adl_history()
+    assert len(adl) == 1 and adl.iloc[0]["status"] == "COVERED" and adl.iloc[0]["phi"] == pytest.approx(0.5)
+    fills = repo.adl_fills()
+    assert fills.iloc[0]["agent_name"] == "winner" and fills.iloc[0]["haircut"] == pytest.approx(5_000)
+    fund = repo.fund_overview()
+    assert fund.adl_events == 1 and fund.adl_recovered == pytest.approx(5_000) and fund.balance == pytest.approx(0)
+
+    ControlPlane(clean_db).publish("NORMAL", {"BTC": {"mark": 100_000.0}},
+                                   {"risk": {"var": 4_000.0, "es": 5_000.0, "alpha": 0.99, "horizon_ticks": 12,
+                                             "by_account": {"winner": {"var": 4_000.0, "es": 5_000.0}}}})
+    health = repo.accounts_health()
+    risk = risk_overview(repo.control_state(), health.table, 20_000.0)
+    assert risk.open_interest == pytest.approx(50_000)          # 0.5 BTC tras el ADL × 100 000
+    assert risk.coverage_ratio == pytest.approx(0.4) and risk.fund_to_es == pytest.approx(4.0)
+    offline = ControlState("OFFLINE", None, None, None, {}, {"risk": {"var": 1.0}}, 0)
+    assert risk_overview(offline, health.table, 1.0).var is None   # sin heartbeat no se muestran métricas viejas
+
+
+def test_streamlit_adl_tab_and_risk_kpis(app_env):
+    from streamlit.testing.v1 import AppTest
+
+    from risk_engine.adl import AdlEngine
+
+    seed_insurance_fund(app_env, 1.0)
+    with app_env.transaction() as cur:
+        cur.execute("UPDATE insurance_fund SET balance = -5000 WHERE fund_id = 1")
+    seed_account(app_env, "winner", "WHALE_AGGRESSIVE", 50_000, [("BTC", 1.0, 90_000, 10, 0.0125)])
+    AdlEngine(app_env, make_store({"BTC": {"mark": 100_000.0}})).run()
+    ControlPlane(app_env).publish("NORMAL", {"BTC": {"mark": 100_000.0, "oracle": 100_000.0}},
+                                  {"risk": {"var": 4_000.0, "es": 5_000.0, "alpha": 0.99, "horizon_ticks": 12,
+                                            "by_account": {"winner": {"var": 4_000.0, "es": 5_000.0}}},
+                                   "stress_coverage": {"jump": 0.3, "worst_deficit": 50_000.0, "ratio": 2.0}})
+    at = AppTest.from_file(str(ROOT / "dashboard" / "app.py"), default_timeout=30).run()
+    assert not at.exception, at.exception
+    m = {x.label: x for x in at.metric}
+    assert m["ADL ejecutados"].value == "1" and m["Recuperado"].value == "$5,000.00"
+    assert m["VaR 99% cartera"].value == "$4.0k" and m["VaR 99% cartera"].delta == "ES $5.0k"
+    assert m["Cobertura IF / OI"].value == "0.00%"               # fondo repuesto a 0 tras el ADL
+    assert m["φ máxima"].value == "50.00%"
+    assert not at.error                                          # fondo ya no está en negativo
 
 
 def test_streamlit_controls_require_operator_password(app_env, monkeypatch):

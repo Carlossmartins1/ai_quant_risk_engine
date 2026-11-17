@@ -51,6 +51,7 @@ __all__ = [
     "cornish_fisher_var",
     "component_var",
     "ewma_covariance",
+    "ewma_var_es",
     "kupiec_pof_test",
     "KupiecResult",
 ]
@@ -302,6 +303,37 @@ def parametric_var_es(
     else:
         raise ValueError("dist debe ser 'normal' o 't'")
     return RiskEstimate(_squeeze(var, single), _squeeze(es, single), alpha, horizon, method)
+
+
+def ewma_var_es(
+    prices: ArrayLike,
+    exposure: ArrayLike,
+    *,
+    alpha: float = 0.99,
+    horizon: int = 1,
+    lam: float = 0.94,
+    dist: str = "t",
+    nu: float = 4.0,
+    min_obs: int = 30,
+) -> RiskEstimate | None:
+    """
+    VaR/ES en tiempo real a partir de la historia de precios: log-retornos → covarianza EWMA
+    (RiskMetrics, reacciona en pocos pasos a un cambio de régimen) → VaR/ES paramétrico, Student-t
+    por defecto (colas gruesas). Pensado para el panel de riesgo: vectorizado sobre U carteras.
+
+    Args:
+        prices: (T, N) precios alineados por paso (una columna por activo).
+        exposure: (N,) o (U, N) exposición con signo en USD (``q · mark``).
+        min_obs: retornos mínimos; con menos devuelve ``None`` (estimación no fiable).
+    """
+    P = np.asarray(prices, dtype=np.float64)
+    if P.ndim != 2:
+        raise ValueError("prices debe ser (T, N)")
+    if len(P) - 1 < min_obs or np.any(~np.isfinite(P)) or np.any(P <= 0):
+        return None
+    R = np.diff(np.log(P), axis=0)
+    cov = ewma_covariance(R, lam)
+    return parametric_var_es(exposure, (cov + cov.T) / 2, alpha=alpha, horizon=horizon, dist=dist, nu=nu)
 
 
 def cornish_fisher_var(pnl: ArrayLike, alpha: float = 0.99) -> FloatArray | float:
