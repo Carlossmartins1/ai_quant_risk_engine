@@ -385,3 +385,22 @@ def test_burst_stops_pushing_price_after_gateway_reject():
     orch._execute(agent, 1, AgentAction(agent.name, agent.persona.profile, "RULES", "t", bursts=(burst,)))
     assert len(flows) == 3                                                    # 2 OK + la rechazada; no 10
     assert orch._actions[-1]["rejected"] == 1
+
+
+@pytest.mark.integration
+def test_orchestrator_black_swan_with_thin_fund_runs_adl(clean_db):
+    """Fondo casi vacío: el déficit de la ballena lo agota y el ADL lo repone con los beneficios del corto."""
+    seed_insurance_fund(clean_db, 10)
+    agents = [TradingAgent(AgentPersona.whale(directional_bias="LONG")), TradingAgent(AgentPersona.arbitrageur()),
+              TradingAgent(AgentPersona.manipulator())]
+    cfg = OrchestratorConfig(tick_interval_s=0.05, risk_interval_s=0.05, decision_interval_s=0.4,
+                             black_swan_after_s=1.5, stress_paths=300, seed=11, stress_crash_steps=1)
+    s = Orchestrator(clean_db, config=cfg, agents=agents).run(6.0).summary
+    assert s["adl_events"] >= 1 and s["adl_recovered_usd"] > 0 and s["adl_residual_usd"] == 0
+    assert s["insurance_fund_end"] == pytest.approx(
+        10 - s["deficit_absorbed_usd"] + s["fees_collected_usd"] + s["adl_recovered_usd"], abs=0.01)
+    with clean_db.transaction(readonly=True) as cur:
+        cur.execute("SELECT trigger_batch_id FROM adl_events ORDER BY adl_event_id LIMIT 1")
+        trigger = cur.fetchone()["trigger_batch_id"]
+        cur.execute("SELECT count(*) AS n FROM liquidation_events WHERE liquidation_batch_id = %s", (trigger,))
+        assert cur.fetchone()["n"] >= 1                                     # trazable hasta la liquidación

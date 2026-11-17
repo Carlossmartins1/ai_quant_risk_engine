@@ -9,7 +9,7 @@ Archivado en S3 de logs y registros de auditoría del Risk Engine.
    forma atómica a ``LOG_DIR/.spool/`` (``os.replace`` en el mismo filesystem: sin carreras con
    ``RotatingFileHandler``), se comprime con gzip y se sube. Solo se borra en local tras verificar con
    ``HeadObject`` que el tamaño remoto coincide. Si algo falla, queda en el spool y se reintenta.
-2. **Auditoría** (``--export-audit``): exporta incrementalmente ``liquidation_events`` e
+2. **Auditoría** (``--export-audit``): exporta incrementalmente ``liquidation_events``, ``adl_events``, ``adl_fills`` e
    ``insurance_fund_ledger`` (tablas append-only) a NDJSON.gz. La marca de agua vive en S3
    (``_state/audit_watermark.json``): el proceso es *stateless* y re-ejecutable.
 
@@ -51,7 +51,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 log = logging.getLogger("log_shipper")
 
-AUDIT_TABLES = {"liquidation_events": "event_id", "insurance_fund_ledger": "entry_id"}
+AUDIT_TABLES = {"liquidation_events": "event_id", "insurance_fund_ledger": "entry_id",
+                "adl_events": "adl_event_id", "adl_fills": "adl_fill_id"}
 WATERMARK_KEY = "_state/audit_watermark.json"
 
 

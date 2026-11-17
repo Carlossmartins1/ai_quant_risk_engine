@@ -36,7 +36,14 @@ Economía de la liquidación (por cuenta)
     fee             = min(fee_rate · Σ |q_i|·exec_px_i ,  max(equity_after, 0))   -- nunca crea déficit
     deficit         = max(−equity_after, 0)                                       -- bad debt
     collateral_new  = max(equity_after, 0) − fee
-    insurance_fund += fee − deficit       (balance < 0 => fondo agotado => ADL en fases futuras)
+    insurance_fund += fee − deficit       (balance < 0 => fondo agotado => ADL, ver risk_engine/adl.py)
+
+Auto-Deleveraging
+-----------------
+Si una liquidación deja el fondo en negativo, ``run_cycle`` ejecuta a continuación el ADL
+(``AdlEngine``) en su propia transacción: recorta pro-rata las posiciones ganadoras y repone el
+fondo, con auditoría en ``adl_events``/``adl_fills``. Mientras quede un residual, cada ciclo lo
+reintenta con las nuevas ganancias. Se desactiva con ``LiquidationConfig(adl_enabled=False)``.
 
 Precio de ejecución
 -------------------
@@ -73,6 +80,7 @@ from database.connection import (
     lock_open_positions,
     retry_on_transient,
 )
+from risk_engine.adl import AdlConfig, AdlEngine, AdlOutcome
 from risk_engine.margin_calculator import MarginCalculator, MarginSnapshot, compute_margins
 
 if TYPE_CHECKING:
@@ -89,6 +97,7 @@ __all__ = [
     "CycleReport",
     "LiquidationExecutor",
     "LiveExecutionError",
+    "AdlOutcome",
 ]
 
 log = structlog.get_logger(__name__)
@@ -152,6 +161,8 @@ class LiquidationConfig:
     lock_timeout_ms: int = 1_000
     statement_timeout_ms: int = 10_000
     max_retries: int = 3
+    adl_enabled: bool = True                   # auto-deleveraging cuando el Insurance Fund queda en negativo
+    adl_min_health: float = 1.10               # health ratio mínimo que el ADL respeta en las contrapartes
 
     def __post_init__(self) -> None:
         if not 0 <= self.liquidation_fee_rate < 0.1:
@@ -219,6 +230,7 @@ class CycleReport:
     snapshot: MarginSnapshot
     outcomes: tuple[LiquidationOutcome, ...]
     duration_ms: float
+    adl: tuple[AdlOutcome, ...] = ()
 
     @property
     def liquidated(self) -> tuple[LiquidationOutcome, ...]:
@@ -257,6 +269,13 @@ class LiquidationExecutor:
         self.calculator = MarginCalculator(db, store, max_price_age_s=self.config.max_price_age_s)
         if self.config.mode is ExecutionMode.LIVE_TESTNET and client_resolver is None:
             raise ValueError("El modo LIVE_TESTNET requiere client_resolver")
+        self.adl = AdlEngine(
+            db, store,
+            AdlConfig(lock_timeout_ms=self.config.lock_timeout_ms, statement_timeout_ms=self.config.statement_timeout_ms,
+                      max_price_age_s=self.config.max_price_age_s, max_retries=self.config.max_retries,
+                      min_health=self.config.adl_min_health),
+            regime=self.config.regime.value,
+        ) if self.config.adl_enabled else None
 
     # ------------------------------------------------------------- ciclo
     def run_cycle(self) -> CycleReport:
@@ -264,13 +283,27 @@ class LiquidationExecutor:
         t0 = time.perf_counter()
         snap = self.calculator.snapshot()
         outcomes = tuple(self.liquidate_account(int(uid)) for uid in snap.liquidatable().index)
-        report = CycleReport(snap, outcomes, (time.perf_counter() - t0) * 1e3)
+        adl = self._run_adl(outcomes)
+        report = CycleReport(snap, outcomes, (time.perf_counter() - t0) * 1e3, adl)
         if outcomes:
             log.info(
                 "liquidation.cycle", candidates=len(outcomes), liquidated=len(report.liquidated),
                 duration_ms=round(report.duration_ms, 2), **snap.summary(),
             )
         return report
+
+    def _run_adl(self, outcomes: Sequence[LiquidationOutcome]) -> tuple[AdlOutcome, ...]:
+        """ADL tras la liquidación que agotó el fondo (siempre auditado) o reintento de un residual."""
+        if self.adl is None:
+            return ()
+        trigger = next((o.batch_id for o in reversed(outcomes) if o.liquidated and o.insurance_fund_balance is not None
+                        and o.insurance_fund_balance < 0), None)
+        try:
+            result = self.adl.run(trigger_batch_id=trigger)
+        except Exception:  # noqa: BLE001 - un fallo del ADL no invalida las liquidaciones ya confirmadas
+            log.exception("adl.error", trigger_batch_id=str(trigger) if trigger else None)
+            return ()
+        return () if result is None else (result,)
 
     def run_forever(self, stop: threading.Event, interval_s: float = 1.0) -> None:
         """Bucle de vigilancia. Un fallo de ciclo se registra y no detiene el motor."""
@@ -419,7 +452,7 @@ class LiquidationExecutor:
                 cur.execute("UPDATE insurance_fund SET balance = %s WHERE fund_id = 1", (balance,))
             if balance < 0:
                 log.critical("insurance_fund.depleted", balance=str(balance), batch_id=str(batch_id),
-                             action="ADL requerido")
+                             action="ADL" if cfg.adl_enabled else "ADL desactivado: déficit sin socializar")
 
             # 9) Cuenta: colateral residual y estado final
             cur.execute(

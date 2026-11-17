@@ -66,6 +66,7 @@ from ai_agents.trader_agents import (
 )
 from database.connection import DatabaseManager, lock_account
 from quant_models.monte_carlo import ScenarioConfig
+from risk_engine.adl import AdlOutcome
 from risk_engine.liquidation_executor import (
     LiquidationConfig,
     LiquidationExecutor,
@@ -171,6 +172,7 @@ class Orchestrator:
         self._rec_lock = threading.Lock()
         self._timeline: list[dict[str, Any]] = []
         self._outcomes: list[tuple[float, LiquidationOutcome, str]] = []
+        self._adl: list[tuple[float, AdlOutcome, str]] = []
         self._actions: list[dict[str, Any]] = []
         self._mode_changes: list[tuple[float, str]] = []
         self._fund_balance = math.nan
@@ -380,11 +382,15 @@ class Orchestrator:
         with self._rec_lock:
             n_liq = len(self._outcomes)
             deficit = float(sum(o.deficit for _, o, _ in self._outcomes))
+            n_adl = len(self._adl)
+            adl_recovered = float(sum(a.recovered for _, a, _ in self._adl))
         self.control.publish(
             self._mode.value,
             self.market.state(),
             {"elapsed_s": round(self._elapsed(), 1), "liquidations": n_liq, "deficit_usd": round(deficit, 2),
              "fund_balance": self._fund_balance, "source": getattr(self._source, "name", None),
+             "adl_events": n_adl, "adl_recovered_usd": round(adl_recovered, 2),
+             "stress_coverage": None if self.coverage is None else self.coverage.as_dict(),
              "agents": {name: uid for name, uid in self._user_ids.items()}},
         )
 
@@ -392,6 +398,9 @@ class Orchestrator:
     def _risk_tick(self) -> None:
         mode = self._mode
         report = self.executors[mode].run_cycle()
+        if report.adl:
+            with self._rec_lock:
+                self._adl.extend((self._elapsed(), a, mode.value) for a in report.adl)
         if report.liquidated:
             now = self._elapsed()
             with self._rec_lock:
@@ -505,6 +514,7 @@ class Orchestrator:
             timeline = pd.DataFrame(self._timeline)
             actions = pd.DataFrame(self._actions)
             outcomes = list(self._outcomes)
+            adl = list(self._adl)
             mode_changes = tuple(self._mode_changes)
         names = {uid: name for name, uid in self._user_ids.items()}
         liq = pd.DataFrame([
@@ -532,7 +542,10 @@ class Orchestrator:
             "insurance_fund_start": round(fund_start, 2),
             "insurance_fund_end": round(fund_end, 2),
             "insurance_fund_min": round(min(self._fund_min, fund_end), 2),
-            "adl_required": fund_end < 0,
+            "adl_events": len(adl),
+            "adl_recovered_usd": round(float(sum(a.recovered for _, a, _ in adl)), 2),
+            "adl_positions_deleveraged": sum(len(a.fills) for _, a, _ in adl),
+            "adl_residual_usd": round(max(0.0, -fund_end), 2),
             "agent_equity_end": equities,
             "agent_actions": len(actions),
             "llm_fallbacks": int((actions["source"] == "RULES_FALLBACK").sum()) if not actions.empty else 0,

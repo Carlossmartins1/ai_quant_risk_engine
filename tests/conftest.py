@@ -71,8 +71,8 @@ def clean_db(db: DatabaseManager) -> DatabaseManager:
     """Estado vacío por test. TRUNCATE no dispara los triggers append-only (son de fila)."""
     with db.transaction() as cur:
         cur.execute(
-            "TRUNCATE insurance_fund_ledger, liquidation_events, open_positions, users_collateral, "
-            "simulation_commands RESTART IDENTITY CASCADE"
+            "TRUNCATE adl_fills, adl_events, insurance_fund_ledger, liquidation_events, open_positions, "
+            "users_collateral, simulation_commands RESTART IDENTITY CASCADE"
         )
         cur.execute("UPDATE insurance_fund SET balance = 0 WHERE fund_id = 1")
         cur.execute("UPDATE simulation_control SET current_mode = 'OFFLINE', heartbeat_at = NULL, "
