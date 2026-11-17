@@ -3,7 +3,7 @@
 #  Punto de entrada por rol del contenedor (PID 1 = tini, que reenvía SIGTERM).
 #
 #    orchestrator [args]   agentes + mercado + motor de liquidación (servicio continuo)
-#    dashboard             Streamlit en :8501
+#    dashboard             Plotly Dash (gunicorn) en :8501
 #    migrate               aplica migraciones SQL pendientes y termina
 #    shipper [args]        sube a S3 logs rotados y exportaciones de auditoría (bucle)
 #    shell                 depuración
@@ -77,11 +77,11 @@ case "${ROLE}" in
     fi
     wait_for_db
     log "arrancando dashboard"
-    exec streamlit run dashboard/app.py \
-      --server.port="${DASHBOARD_PORT:-8501}" \
-      --server.address=0.0.0.0 \
-      --server.headless=true \
-      --browser.gatherUsageStats=false "$@"
+    # 1 worker: la serie precio simulado vs. real vive en memoria del proceso; hilos para los callbacks
+    exec gunicorn dashboard.app:server \
+      --bind="0.0.0.0:${DASHBOARD_PORT:-8501}" \
+      --workers=1 --threads="${DASHBOARD_THREADS:-8}" \
+      --timeout=60 --access-logfile=- "$@"
     ;;
   migrate)
     wait_for_db

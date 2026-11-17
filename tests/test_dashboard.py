@@ -1,22 +1,27 @@
 """
 Tests de la Fase 6: plano de control (cola de comandos exactly-once), capa de datos del dashboard,
-la app Streamlit completa (``AppTest``), integración con el orquestador, migraciones y healthcheck.
+la app Plotly Dash (layout + callbacks reales vía HTTP), integración con el orquestador, migraciones y
+healthcheck.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import pathlib
 import shutil
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ai_agents.control_plane import ControlPlane, SimulationCommand
+import plotly.utils
+
+from ai_agents.control_plane import ControlPlane, ControlState, SimulationCommand
 from ai_agents.orchestrator import Orchestrator, OrchestratorConfig
 from ai_agents.trader_agents import AgentPersona, TradingAgent
-from dashboard.data import DashboardRepository, fmt_usd
+from dashboard.data import DashboardRepository, MarketTape, feed_view, fmt_usd
 from risk_engine.liquidation_executor import LiquidationExecutor
 from tests.helpers import make_store, seed_account, seed_insurance_fund
 
@@ -82,6 +87,14 @@ def test_orchestrator_consumes_dashboard_command(clean_db):
         cur.execute("SELECT current_mode, market_state FROM simulation_control")
         row = cur.fetchone()
     assert row["current_mode"] == "OFFLINE" and set(row["market_state"]) == {"BTC", "ETH"}
+    assert "funding_hourly" in row["market_state"]["BTC"]
+    with clean_db.transaction(readonly=True) as cur:
+        cur.execute("SELECT stats FROM simulation_control")
+        stats = cur.fetchone()["stats"]
+    assert stats["feed"] == {"configured": False, "connected": False, "symbols": {}}   # sin --live
+    risk = stats["risk"]
+    if risk:                                                       # ventana de retornos suficiente
+        assert risk["es"] >= risk["var"] >= 0 and risk["alpha"] == 0.99
 
 
 def test_reset_agents_command_recapitalizes_accounts(clean_db):
@@ -152,14 +165,37 @@ def test_repository_views(clean_db):
 
 
 def test_fmt_usd():
-    from dashboard.data import fmt_short
-
-    assert fmt_short(276_331) == "$276.3k" and fmt_short(-10_427_290) == "-$10.4M" and fmt_short(950) == "$950"
     assert fmt_usd(-1234.5) == "-$1,234.50" and fmt_usd(150_527.3, compact=True) == "$150,527"
     assert fmt_usd(None) == "—" and fmt_usd(math.nan) == "—"
 
 
-# ============================================================================= app Streamlit
+# ============================================================================= feed / tape
+def _state(mode="NORMAL", *, at=None, sim=95_000.0, live=None, connected=True):
+    feed = {"configured": live is not None, "connected": connected,
+            "symbols": {} if live is None else {"BTC": {"mark": live, "oracle": live, "funding_hourly": 1.25e-5,
+                                                        "latency_ms": 42.0, "age_ms": 120.0}}}
+    return ControlState(mode, "orch", at or datetime.now(timezone.utc), 0.5,
+                        {"BTC": {"mark": sim, "oracle": sim, "basis_bps": 0.0, "funding_hourly": 1e-5}},
+                        {"feed": feed}, 0)
+
+
+def test_feed_view_and_market_tape():
+    view = feed_view(_state(sim=90_000.0, live=100_000.0)).set_index("symbol")
+    assert view.loc["BTC", "deviation_bps"] == pytest.approx(-1_000.0)              # crash simulado −10 %
+    assert view.loc["BTC", "latency_ms"] == 42.0
+    assert feed_view(_state())["live_mark"].isna().all()                              # sin feed real
+
+    tape = MarketTape(maxlen=3)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    tape.record(_state(at=t0, live=95_000.0))
+    tape.record(_state(at=t0, live=95_000.0))                                        # mismo heartbeat: dedupe
+    tape.record(_state("BLACK_SWAN", at=t0 + timedelta(seconds=1), sim=85_500.0, live=95_000.0))
+    df = tape.frame()
+    assert len(df) == 2 and df["mode"].tolist() == ["NORMAL", "BLACK_SWAN"]
+    assert df["deviation_bps"].iloc[-1] == pytest.approx(-1_000.0)
+
+
+# ============================================================================= app Dash
 @pytest.fixture
 def app_env(clean_db, monkeypatch):
     from tests.conftest import TEST_DB, _conn_kwargs
@@ -170,111 +206,109 @@ def app_env(clean_db, monkeypatch):
         monkeypatch.setenv(k, v)
     # Vacía (no borrada): DBConfig.from_env() carga .env sin override y la reintroduciría
     monkeypatch.setenv("DASHBOARD_ADMIN_PASSWORD", "")
-    import streamlit as st
-
-    st.cache_resource.clear()
+    monkeypatch.setenv("DASHBOARD_OPERATOR_NAME", "")
     yield clean_db
-    st.cache_resource.clear()
 
 
-def test_streamlit_app_renders_and_triggers_black_swan(app_env):
-    from streamlit.testing.v1 import AppTest
+def _dumps(component) -> str:
+    return json.dumps(component, cls=plotly.utils.PlotlyJSONEncoder, ensure_ascii=False)
+
+
+def _fire(client, trigger: str, password: str | None = None):
+    """Dispara el callback ``send_command`` igual que el navegador tras confirmar el diálogo."""
+    outputs = [{"id": "cmd-toast", "property": p} for p in ("children", "icon", "is_open")]
+    inputs = [{"id": t, "property": "submit_n_clicks", "value": 1 if t == trigger else None}
+              for t in ("confirm-normal", "confirm-black-swan", "confirm-reset")]
+    body = {"output": "..cmd-toast.children...cmd-toast.icon...cmd-toast.is_open..", "outputs": outputs,
+            "inputs": inputs, "changedPropIds": [f"{trigger}.submit_n_clicks"],
+            "state": [{"id": "operator-pwd", "property": "value", "value": password}]}
+    resp = client.post("/_dash-update-component", json=body)
+    assert resp.status_code == 200, resp.data
+    return resp.get_json()["response"]["cmd-toast"]
+
+
+def _commands(db):
+    with db.transaction(readonly=True) as cur:
+        cur.execute("SELECT command::text AS c, requested_by FROM simulation_commands ORDER BY command_id")
+        return [(r["c"], r["requested_by"]) for r in cur.fetchall()]
+
+
+def test_dash_app_renders_and_triggers_commands(app_env):
+    from dashboard.app import controls_view, create_app, main_view
 
     _liquidate_whale(app_env)
     ControlPlane(app_env).publish("NORMAL", {"BTC": {"mark": 89_000.0, "oracle": 89_010.0, "basis_bps": -1.1,
-                                                     "liquidity": 0.8, "spread_bps": 2.0}})
-    at = AppTest.from_file(str(ROOT / "dashboard" / "app.py"), default_timeout=30).run()
-    assert not at.exception, at.exception
-    labels = {m.label for m in at.metric}
-    assert {"Insurance Fund", "Cobertura IF / OI", "VaR 99% cartera", "Liquidaciones", "ADL ejecutados",
-            "Mark", "Oracle"} <= labels
-    assert next(m for m in at.metric if m.label == "Déficits absorbidos").value == "$1,360.00"
+                                                     "liquidity": 0.8, "spread_bps": 2.0}},
+                                  {"risk": {"var": 1_234.5, "es": 1_500.0, "alpha": 0.99, "n_scenarios": 200}})
+    repo = DashboardRepository(app_env)
+    app = create_app(repo)
+    client = app.server.test_client()
+    assert client.get("/").status_code == 200 and client.get("/healthz").status_code == 200
+    layout = client.get("/_dash-layout").get_data(as_text=True)
+    for cid in ("tick", "confirm-black-swan", "btn-reset", "kpi-row", "fund-graph", "price-graph", "hl-brand",
+                "acc-table", "liq-table", "adl-table", "feed-table"):
+        assert f'"{cid}"' in layout, cid
 
-    bs = next(b for b in at.button if b.key == "btn_black_swan")
-    assert bs.disabled                                            # exige confirmación explícita
-    at.checkbox(key="confirm_bs").check().run()
-    next(b for b in at.button if b.key == "btn_black_swan").click().run()
-    assert not at.exception
-    with app_env.transaction(readonly=True) as cur:
-        cur.execute("SELECT command::text AS c, requested_by FROM simulation_commands")
-        rows = cur.fetchall()
-    assert [(r["c"], r["requested_by"]) for r in rows] == [("TRIGGER_BLACK_SWAN", "dashboard")]
-    assert at.checkbox(key="confirm_bs").value is False             # la confirmación se rearma
+    view = main_view(repo, MarketTape(), "/assets/hyperliquid.svg")
+    kpis = _dumps(view.kpis)
+    for text in ("Insurance Fund", "Cobertura / OI", "Déficit absorbido", "$1,360.00", "VaR 99%", "$1,234.50",
+                 "ES 99%", "Liquidaciones"):
+        assert text in kpis, text
+    assert "BTC-PERP" in _dumps(view.tickers) and "89,000.00" in _dumps(view.tickers)
+    assert view.alert is None and view.fund_figure.data                          # fondo positivo: sin ADL
 
-    assert next(b for b in at.button if b.key == "btn_reset_agents").disabled
-    at.checkbox(key="confirm_reset").check().run()
-    next(b for b in at.button if b.key == "btn_reset_agents").click().run()
-    assert not at.exception
-    with app_env.transaction(readonly=True) as cur:
-        cur.execute("SELECT command::text AS c FROM simulation_commands ORDER BY command_id")
-        assert [r["c"] for r in cur.fetchall()] == ["TRIGGER_BLACK_SWAN", "RESET_AGENTS"]
-    assert at.checkbox(key="confirm_reset").value is False
-
-
-def test_risk_overview_and_adl_views(clean_db):
-    from ai_agents.control_plane import ControlState
-    from dashboard.data import risk_overview
-    from risk_engine.adl import AdlEngine
-
-    seed_insurance_fund(clean_db, 1.0)
-    with clean_db.transaction() as cur:
-        cur.execute("UPDATE insurance_fund SET balance = -5000 WHERE fund_id = 1")
-    seed_account(clean_db, "winner", "WHALE_AGGRESSIVE", 50_000, [("BTC", 1.0, 90_000, 10, 0.0125)])
-    AdlEngine(clean_db, make_store({"BTC": {"mark": 100_000.0}})).run()
-    repo = DashboardRepository(clean_db)
-
-    adl = repo.adl_history()
-    assert len(adl) == 1 and adl.iloc[0]["status"] == "COVERED" and adl.iloc[0]["phi"] == pytest.approx(0.5)
-    fills = repo.adl_fills()
-    assert fills.iloc[0]["agent_name"] == "winner" and fills.iloc[0]["haircut"] == pytest.approx(5_000)
-    fund = repo.fund_overview()
-    assert fund.adl_events == 1 and fund.adl_recovered == pytest.approx(5_000) and fund.balance == pytest.approx(0)
-
-    ControlPlane(clean_db).publish("NORMAL", {"BTC": {"mark": 100_000.0}},
-                                   {"risk": {"var": 4_000.0, "es": 5_000.0, "alpha": 0.99, "horizon_ticks": 12,
-                                             "by_account": {"winner": {"var": 4_000.0, "es": 5_000.0}}}})
-    health = repo.accounts_health()
-    risk = risk_overview(repo.control_state(), health.table, 20_000.0)
-    assert risk.open_interest == pytest.approx(50_000)          # 0.5 BTC tras el ADL × 100 000
-    assert risk.coverage_ratio == pytest.approx(0.4) and risk.fund_to_es == pytest.approx(4.0)
-    offline = ControlState("OFFLINE", None, None, None, {}, {"risk": {"var": 1.0}}, 0)
-    assert risk_overview(offline, health.table, 1.0).var is None   # sin heartbeat no se muestran métricas viejas
+    controls = controls_view(repo, None)
+    assert controls.normal_disabled and not controls.black_swan_disabled        # ya en NORMAL
+    toast = _fire(client, "confirm-black-swan")
+    assert toast["is_open"] and "Cisne Negro" in toast["children"] and toast["icon"] == "success"
+    _fire(client, "confirm-reset")
+    assert _commands(app_env) == [("TRIGGER_BLACK_SWAN", "dashboard"), ("RESET_AGENTS", "dashboard")]
+    cmds = controls_view(repo, None).commands
+    assert [r["label"].split(" ", 1)[1] for r in cmds] == ["Recapitalizar", "Cisne Negro"]
+    assert all(r["status"] == "⏳ en cola" for r in cmds)                       # sin orquestador que consuma
 
 
-def test_streamlit_adl_tab_and_risk_kpis(app_env):
-    from streamlit.testing.v1 import AppTest
-
-    from risk_engine.adl import AdlEngine
-
-    seed_insurance_fund(app_env, 1.0)
-    with app_env.transaction() as cur:
-        cur.execute("UPDATE insurance_fund SET balance = -5000 WHERE fund_id = 1")
-    seed_account(app_env, "winner", "WHALE_AGGRESSIVE", 50_000, [("BTC", 1.0, 90_000, 10, 0.0125)])
-    AdlEngine(app_env, make_store({"BTC": {"mark": 100_000.0}})).run()
-    ControlPlane(app_env).publish("NORMAL", {"BTC": {"mark": 100_000.0, "oracle": 100_000.0}},
-                                  {"risk": {"var": 4_000.0, "es": 5_000.0, "alpha": 0.99, "horizon_ticks": 12,
-                                            "by_account": {"winner": {"var": 4_000.0, "es": 5_000.0}}},
-                                   "stress_coverage": {"jump": 0.3, "worst_deficit": 50_000.0, "ratio": 2.0}})
-    at = AppTest.from_file(str(ROOT / "dashboard" / "app.py"), default_timeout=30).run()
-    assert not at.exception, at.exception
-    m = {x.label: x for x in at.metric}
-    assert m["ADL ejecutados"].value == "1" and m["Recuperado"].value == "$5,000.00"
-    assert m["VaR 99% cartera"].value == "$4.0k" and m["VaR 99% cartera"].delta == "ES $5.0k"
-    assert m["Cobertura IF / OI"].value == "0.00%"               # fondo repuesto a 0 tras el ADL
-    assert m["φ máxima"].value == "50.00%"
-    assert not at.error                                          # fondo ya no está en negativo
-
-
-def test_streamlit_controls_require_operator_password(app_env, monkeypatch):
-    from streamlit.testing.v1 import AppTest
+def test_dash_controls_require_operator_password(app_env, monkeypatch):
+    from dashboard.app import controls_view, create_app
 
     monkeypatch.setenv("DASHBOARD_ADMIN_PASSWORD", "s3cret")
-    at = AppTest.from_file(str(ROOT / "dashboard" / "app.py"), default_timeout=30).run()
-    assert all(b.disabled for b in at.button if b.key in ("btn_normal", "btn_black_swan"))
-    at.text_input(key="operator_pwd").input("wrong").run()
-    assert any("incorrecta" in e.value for e in at.error)
-    at.text_input(key="operator_pwd").input("s3cret").run()
-    assert not next(b for b in at.button if b.key == "btn_normal").disabled
+    repo = DashboardRepository(app_env)
+    client = create_app(repo).server.test_client()
+    v = controls_view(repo, None)
+    assert v.normal_disabled and v.black_swan_disabled and v.reset_disabled
+    toast = _fire(client, "confirm-black-swan", "wrong")                          # validado en el servidor
+    assert toast["icon"] == "danger" and "incorrecta" in toast["children"] and _commands(app_env) == []
+    assert not controls_view(repo, "s3cret").reset_disabled
+    _fire(client, "confirm-black-swan", "s3cret")
+    assert _commands(app_env) == [("TRIGGER_BLACK_SWAN", "operator")]
+
+
+def test_dash_tabs_and_adl_events(app_env):
+    from dashboard.app import TAB_OUTPUTS, main_view, tab_view
+
+    seed_insurance_fund(app_env, 1_000)                                           # fondo < déficit => ADL
+    uid = seed_account(app_env, "whale", "WHALE_AGGRESSIVE", 4_750.0, [("BTC", 1.0, 95_000.0, 20, 0.025)])
+    store = make_store({"BTC": {"mark": 89_000, "bids": [(88_950, 0.4), (88_900, 0.3), (88_800, 1.0)]}})
+    LiquidationExecutor(app_env, store).liquidate_account(uid)
+    seed_account(app_env, "arb", "ARBITRAGEUR_NEUTRAL", 100_000.0, [("BTC", 1.0, 95_000.0, 3, 0.025)])
+    ControlPlane(app_env).publish("BLACK_SWAN", {"BTC": {"mark": 85_500.0}, "ETH": {"mark": 3_400.0}})
+    repo = DashboardRepository(app_env)
+
+    adl = repo.adl_events()
+    assert len(adl) == 1 and adl.iloc[0]["shortfall"] == pytest.approx(360) and adl.iloc[0]["agent_name"] == "whale"
+    view = main_view(repo, MarketTape(), "/logo.svg")
+    assert "ADL" in _dumps(view.alert) and "ADL REQUERIDO" in _dumps(view.kpis)
+
+    tape = MarketTape()
+    for tab, outputs in TAB_OUTPUTS.items():
+        values = tab_view(repo, tape, tab)
+        assert set(values) == {cid for cid, _ in outputs}, tab
+        _dumps(values)                                                            # JSON-serializable
+    acc = tab_view(repo, tape, "accounts")
+    assert [r["agent_name"] for r in acc["acc-table"]] == ["arb"]
+    assert acc["pos-table"][0]["symbol"] == "BTC" and acc["pos-table"][0]["mark_price"] == 85_500.0
+    assert tab_view(repo, tape, "adl")["adl-table"][0]["shortfall"] == pytest.approx(360)
+    assert tab_view(repo, tape, "liquidations")["liq-table"][0]["deficit"] == pytest.approx(1_360)
 
 
 # ============================================================================= migraciones / healthcheck

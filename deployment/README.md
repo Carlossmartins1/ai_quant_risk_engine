@@ -16,7 +16,7 @@
 | `postgres` | `postgres:15-alpine` | Ledger ACID (Fase 1) |
 | `migrate` | `engine` | `python -m database.migrate`: esquema + migraciones con checksum y advisory lock |
 | `orchestrator` | `engine` | Agentes, mercado sombra, `LiquidationExecutor`, plano de control |
-| `dashboard` | `dashboard` | Streamlit (sin LangChain/SDKs: imagen ligera) |
+| `dashboard` | `dashboard` | Plotly Dash + gunicorn (sin LangChain/SDKs: imagen ligera) |
 | `log-shipper` | `engine` | Logs rotados + export incremental de auditoría a S3 |
 
 ## Pasos

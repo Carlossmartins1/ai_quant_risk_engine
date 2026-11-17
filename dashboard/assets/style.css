@@ -1,0 +1,103 @@
+/* Terminal de riesgo — estética de terminal financiero oscuro (Dash sirve /assets automáticamente). */
+:root {
+  --bg: #0B0E11;
+  --card: #151A21;
+  --card-hi: #1A2029;
+  --border: #262D3A;
+  --text: #E6EAF0;
+  --muted: #8A94A6;
+  --sim: #4C8DFF;
+  --live: #97FCE4;
+  --good: #16C784;
+  --warn: #F0B90B;
+  --critical: #EA3943;
+  --mono: 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+  --ui: Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+html, body { background: var(--bg) !important; color: var(--text); font-family: var(--ui); font-size: 13px; }
+.mono, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.text-muted-x { color: var(--muted) !important; }
+.up { color: var(--good) !important; }
+.down { color: var(--critical) !important; }
+.warn { color: var(--warn) !important; }
+
+/* ---------------------------------------------------------------- cabecera */
+.topbar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 10px 20px; border-bottom: 1px solid var(--border); background: #0E1217;
+  position: sticky; top: 0; z-index: 20;
+}
+.brand { font-weight: 700; letter-spacing: .04em; font-size: 14px; }
+.brand small { color: var(--muted); font-weight: 500; letter-spacing: .02em; margin-left: 8px; }
+.topbar .spacer { flex: 1; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; background: var(--card);
+}
+.pill.normal { color: var(--good); border-color: rgba(22,199,132,.35); }
+.pill.black-swan { color: var(--critical); border-color: rgba(234,57,67,.5); background: rgba(234,57,67,.08);
+  animation: pulse 1.6s ease-in-out infinite; }
+.pill.offline { color: var(--muted); }
+@keyframes pulse { 50% { box-shadow: 0 0 0 4px rgba(234,57,67,.12); } }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); }
+.dot.on { background: var(--good); box-shadow: 0 0 6px var(--good); }
+.dot.off { background: var(--critical); }
+.dot.idle { background: var(--warn); }
+
+/* ------------------------------------------------------- tira de Hyperliquid */
+.hl-strip {
+  display: flex; align-items: stretch; gap: 0; border-bottom: 1px solid var(--border); background: var(--card);
+  overflow-x: auto;
+}
+.hl-brand {
+  display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-right: 1px solid var(--border);
+  min-width: 230px;
+}
+.hl-brand img { width: 28px; height: 28px; }
+.hl-brand .name { font-weight: 700; color: var(--live); letter-spacing: .05em; font-size: 13px; }
+.hl-brand .status { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.ticker { padding: 8px 18px; border-right: 1px solid var(--border); min-width: 250px; }
+.ticker .sym { font-weight: 700; font-size: 12px; letter-spacing: .06em; }
+.ticker .px { font-family: var(--mono); font-size: 18px; font-weight: 600; }
+.ticker .row-kv { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.ticker .row-kv b { color: var(--text); font-weight: 500; }
+
+/* ---------------------------------------------------------------- tarjetas */
+.panel { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; }
+.panel-title { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 8px; font-weight: 600; }
+.kpi { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; height: 100%; }
+.kpi .label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+.kpi .value { font-family: var(--mono); font-size: 22px; font-weight: 600; margin-top: 4px; white-space: nowrap; }
+.kpi .sub { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 2px; }
+.kpi.alert { border-color: var(--critical); background: linear-gradient(180deg, rgba(234,57,67,.14), var(--card) 70%); }
+.kpi.alert .value { color: var(--critical); }
+.kpi.caution { border-color: rgba(240,185,11,.6); }
+
+/* ---------------------------------------------------------------- lateral */
+.sidebar { background: #0E1217; border-right: 1px solid var(--border); min-height: calc(100vh - 110px); padding: 16px; }
+.sidebar .btn { font-family: var(--mono); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; border-radius: 4px; }
+.sidebar .hint { font-size: 11px; color: var(--muted); }
+.kv { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 12px; padding: 3px 0; border-bottom: 1px dashed #1E2530; }
+.kv span:first-child { color: var(--muted); }
+
+/* ---------------------------------------------------------------- pestañas */
+.nav-tabs { border-bottom-color: var(--border) !important; }
+.nav-tabs .nav-link { color: var(--muted) !important; border: none !important; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+.nav-tabs .nav-link.active { color: var(--text) !important; background: transparent !important; border-bottom: 2px solid var(--live) !important; }
+
+/* ------------------------------------------------------------- tablas Dash */
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner input { color: var(--text) !important; }
+.dash-table-container .previous-next-container { color: var(--muted); }
+
+.alert-adl { background: rgba(234,57,67,.12); border: 1px solid var(--critical); color: #FFB3B8; border-radius: 6px; padding: 10px 14px; font-family: var(--mono); }
+.form-control, .form-control:focus { background: var(--card) !important; border-color: var(--border) !important; color: var(--text) !important; }
+
+@media (max-width: 992px) {
+  .sidebar { min-height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  .topbar { padding: 10px 16px; }
+  .topbar .spacer { display: none; }
+  .hl-brand { min-width: 200px; }
+}
+.container-fluid > .row > [class*="col"] { min-width: 0; }

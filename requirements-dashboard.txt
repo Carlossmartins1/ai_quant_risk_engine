@@ -1,9 +1,11 @@
 # =============================================================================
-#  Dashboard Streamlit (imagen "dashboard"): solo lo necesario para leer PostgreSQL,
+#  Dashboard Plotly Dash (imagen "dashboard"): solo lo necesario para leer PostgreSQL,
 #  recalcular márgenes (risk_engine.margin_calculator) y renderizar. Sin LangChain/SDKs.
 # =============================================================================
-streamlit>=1.67,<2
-altair>=5.4,<7
+dash>=3.0,<4                    # incluye plotly y Flask
+dash-bootstrap-components>=2.0,<3
+plotly>=6.0,<8
+gunicorn>=23.0,<24              # servidor WSGI en el contenedor (1 worker, varios hilos)
 numpy>=1.26,<3
 pandas>=2.2,<4
 psycopg2-binary>=2.9.9,<3

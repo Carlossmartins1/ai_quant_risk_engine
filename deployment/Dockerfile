@@ -6,7 +6,7 @@
 #    docker build -f deployment/Dockerfile --target dashboard -t risk-dashboard:latest .
 #
 #  * engine    : orquestador, motor de liquidación, migraciones y log-shipper (LangChain, SDK HL, boto3...)
-#  * dashboard : Streamlit + lectura de PostgreSQL (≈ 1/3 del tamaño; sin LangChain ni SDKs de exchange)
+#  * dashboard : Plotly Dash (gunicorn) + lectura de PostgreSQL (≈ 1/3 del tamaño; sin LangChain ni SDKs de exchange)
 #
 #  Optimizaciones: builder separado (sin compiladores en runtime), venv copiado entero, caché de pip
 #  con BuildKit, capas de dependencias antes que el código, usuario no root (UID 10001), tini como PID 1
@@ -79,10 +79,9 @@ COPY --chown=app:app database/        /app/database/
 COPY --chown=app:app risk_engine/__init__.py risk_engine/margin_calculator.py /app/risk_engine/
 COPY --chown=app:app ai_agents/__init__.py ai_agents/control_plane.py         /app/ai_agents/
 COPY --chown=app:app dashboard/       /app/dashboard/
-COPY --chown=app:app .streamlit/      /app/.streamlit/
 USER app
 EXPOSE 8501
 ENV SERVICE_ROLE=dashboard
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+    CMD ["curl", "-fsS", "http://127.0.0.1:8501/healthz"]
 CMD ["dashboard"]

@@ -2,7 +2,7 @@
 dashboard/data.py
 =================
 
-Capa de acceso a datos del dashboard (sin dependencias de Streamlit: testeable de forma aislada).
+Capa de acceso a datos del dashboard (sin dependencias de Dash: testeable de forma aislada).
 
 Toda lectura es de solo lectura y sin locks de fila (MVCC): el dashboard nunca compite con el
 motor de liquidación. Los health ratios se calculan con ``risk_engine.margin_calculator`` (misma
@@ -13,8 +13,11 @@ orquestador no está vivo, se recurre al último ``last_mark_price`` conocido y 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import threading
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -23,8 +26,8 @@ from ai_agents.control_plane import ControlPlane, ControlState, SimulationComman
 from database.connection import DatabaseManager
 from risk_engine.margin_calculator import compute_margins, load_risk_inputs
 
-__all__ = ["FundOverview", "AccountsHealth", "RiskOverview", "DashboardRepository", "health_status", "risk_overview",
-           "fmt_usd", "fmt_short"]
+__all__ = ["FundOverview", "AccountsHealth", "RiskOverview", "DashboardRepository", "MarketTape", "health_status",
+           "risk_overview", "feed_view", "open_interest", "fmt_usd", "fmt_short"]
 
 HEALTH_WARNING = 1.2   # alerta temprana: < 20 % de colchón sobre el margen de mantenimiento
 
@@ -89,6 +92,72 @@ class AccountsHealth:
     marks: dict[str, float]
     marks_source: str           # "orchestrator" | "last_mark_price" | "none"
     marks_live: bool
+    positions: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def open_interest(health: AccountsHealth) -> float:
+    """Open interest (nocional bruto a mark) de las cuentas monitorizadas."""
+    if health.table.empty:
+        return 0.0
+    return float(health.table["gross_notional"].fillna(0.0).sum())
+
+
+def feed_view(state: ControlState) -> pd.DataFrame:
+    """
+    Mercado sombra (lo que ve el motor) frente a la referencia real de Hyperliquid, por activo.
+
+    ``deviation_bps`` = (mark simulado − mark real) / mark real: ≈ 0 en Modo Normal con feed en vivo y
+    se dispara durante el Cisne Negro, cuando el motor pasa a la trayectoria de cola del Monte Carlo.
+    """
+    feed = (state.stats or {}).get("feed") or {}
+    live = feed.get("symbols") or {}
+    rows = []
+    for sym in sorted(set(state.market_state or {}) | set(live)):
+        sim = (state.market_state or {}).get(sym) or {}
+        ref = live.get(sym) or {}
+        sim_mark, ref_mark = sim.get("mark"), ref.get("mark")
+        dev = (sim_mark - ref_mark) / ref_mark * 1e4 if sim_mark and ref_mark else None
+        rows.append({
+            "symbol": sym, "sim_mark": sim_mark, "sim_oracle": sim.get("oracle"), "basis_bps": sim.get("basis_bps"),
+            "spread_bps": sim.get("spread_bps"), "liquidity": sim.get("liquidity"),
+            "sim_funding_hourly": sim.get("funding_hourly"), "live_mark": ref_mark, "live_oracle": ref.get("oracle"),
+            "live_funding_hourly": ref.get("funding_hourly"), "deviation_bps": dev,
+            "latency_ms": ref.get("latency_ms"), "age_ms": ref.get("age_ms"),
+        })
+    cols = ["symbol", "sim_mark", "sim_oracle", "basis_bps", "spread_bps", "liquidity", "sim_funding_hourly",
+            "live_mark", "live_oracle", "live_funding_hourly", "deviation_bps", "latency_ms", "age_ms"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+class MarketTape:
+    """
+    Serie temporal en memoria de precios simulados vs. reales (una muestra por heartbeat del orquestador).
+
+    El orquestador solo publica el último estado; el dashboard reconstruye la serie muestreando cada
+    refresco y deduplicando por ``heartbeat_at``. Thread-safe (callbacks concurrentes del servidor).
+    """
+
+    def __init__(self, maxlen: int = 1_800) -> None:
+        self._rows: deque[dict[str, Any]] = deque(maxlen=maxlen)
+        self._last: datetime | None = None
+        self._lock = threading.Lock()
+
+    def record(self, state: ControlState) -> None:
+        if state.heartbeat_at is None or not state.market_state:
+            return
+        view = feed_view(state)
+        with self._lock:
+            if self._last is not None and state.heartbeat_at <= self._last:
+                return
+            self._last = state.heartbeat_at
+            for r in view.itertuples():
+                self._rows.append({"t": state.heartbeat_at, "mode": state.current_mode, "symbol": r.symbol,
+                                   "sim_mark": r.sim_mark, "live_mark": r.live_mark, "deviation_bps": r.deviation_bps})
+
+    def frame(self) -> pd.DataFrame:
+        with self._lock:
+            rows = list(self._rows)
+        return pd.DataFrame(rows, columns=["t", "mode", "symbol", "sim_mark", "live_mark", "deviation_bps"])
 
 
 def health_status(row: pd.Series) -> str:
@@ -183,13 +252,17 @@ class DashboardRepository:
         table = snap.accounts.reset_index()
         if not table.empty:
             table["status"] = table.apply(health_status, axis=1)
+            table["state"] = table["status"].str.split(" ", n=1).str[1]      # texto sin icono
             table["health_ratio"] = table["health_ratio"].replace([np.inf, -np.inf], np.nan)
             pos = snap.positions
             labels = pos["quantity"].map(lambda q: f"{q:+.4g}") + " " + pos["symbol"]
             exposure = labels.groupby(pos["user_id"]).agg(", ".join)
             table["positions"] = table["user_id"].map(exposure).fillna("—")
             table = table.sort_values("health_ratio", na_position="last").reset_index(drop=True)
-        return AccountsHealth(table, marks, source, source == "orchestrator")
+        positions = snap.positions
+        if not positions.empty and not table.empty:
+            positions = positions.merge(table[["user_id", "agent_name"]], on="user_id", how="left")
+        return AccountsHealth(table, marks, source, source == "orchestrator", positions)
 
     def account_status_counts(self) -> dict[str, int]:
         df = self._frame("SELECT account_status::text AS status, count(*) AS n FROM users_collateral GROUP BY 1")

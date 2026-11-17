@@ -1,1 +1,1 @@
-"""Dashboard Streamlit del Risk Engine."""
+"""Terminal de riesgo (Plotly Dash) del Risk Engine."""
