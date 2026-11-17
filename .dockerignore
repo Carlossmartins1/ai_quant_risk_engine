@@ -1,0 +1,25 @@
+# Contexto de build mínimo: solo código y requirements (nunca secretos ni media)
+.git
+.github
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+.venv
+venv
+.env
+.env.*
+Claves.txt
+*.pem
+*.key
+*.zip
+*.log
+logs/
+tests/
+docs/
+RESULTADOS/
+*.mp4
+*.webm
+*.gif
+.idea
+.vscode
+.DS_Store

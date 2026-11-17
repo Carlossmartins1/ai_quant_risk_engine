@@ -1,0 +1,22 @@
+# Configuración de Streamlit (se lee desde el directorio de trabajo: raíz del repo / WORKDIR del contenedor)
+[server]
+headless = true
+port = 8501
+address = "0.0.0.0"
+enableCORS = false
+enableXsrfProtection = true
+maxUploadSize = 1
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+[theme]
+primaryColor = "#2a78d6"
+
+[logger]
+level = "warning"

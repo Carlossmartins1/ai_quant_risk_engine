@@ -25,6 +25,22 @@ require_env() {
   fi
 }
 
+# Rechaza valores de plantilla (change_me, <SSM:...>) que nunca deben llegar a un contenedor.
+reject_placeholders() {
+  local bad=()
+  for var in "$@"; do
+    local value="${!var:-}"
+    [[ -z "${value}" ]] && continue
+    if [[ "${value}" == "change_me" || "${value}" == "<SSM:"* || "${value}" == "changeme" ]]; then
+      bad+=("${var}")
+    fi
+  done
+  if (( ${#bad[@]} )); then
+    printf '{"level":"error","event":"entrypoint","role":"%s","placeholder_secrets":"%s"}\n' "${ROLE}" "${bad[*]}" >&2
+    exit 64
+  fi
+}
+
 wait_for_db() {
   local retries="${DB_WAIT_RETRIES:-30}"
   for ((i = 1; i <= retries; i++)); do
@@ -43,6 +59,7 @@ PY
 }
 
 require_env POSTGRES_HOST POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
+reject_placeholders POSTGRES_PASSWORD DASHBOARD_ADMIN_PASSWORD OPENAI_API_KEY HL_SECRET_KEY
 cd /app
 
 case "${ROLE}" in
@@ -53,6 +70,11 @@ case "${ROLE}" in
     exec python -m ai_agents.orchestrator ${ORCHESTRATOR_ARGS:-} "$@"
     ;;
   dashboard)
+    # En contenedor los controles (Cisne Negro, recapitalización) exigen contraseña de operador,
+    # salvo opt-out explícito para demos locales.
+    if [[ "${DASHBOARD_ALLOW_ANONYMOUS:-false}" != "true" ]]; then
+      require_env DASHBOARD_ADMIN_PASSWORD
+    fi
     wait_for_db
     log "arrancando dashboard"
     exec streamlit run dashboard/app.py \

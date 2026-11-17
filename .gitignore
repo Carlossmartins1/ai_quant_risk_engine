@@ -3,11 +3,15 @@
 venv/
 env/
 
-# Secretos (la plantilla .env.example sí se versiona)
+# Secretos (las plantillas *.example sí se versionan, p.ej. deployment/.env.production.example)
 .env
 .env.*
 !.env.example
+!.env.*.example
 Claves.txt
+*.pem
+*.key
+credentials*.json
 
 # Python
 __pycache__/
