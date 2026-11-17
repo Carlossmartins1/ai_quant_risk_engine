@@ -27,7 +27,7 @@ from database.connection import DatabaseManager
 from risk_engine.margin_calculator import compute_margins, load_risk_inputs
 
 __all__ = ["FundOverview", "AccountsHealth", "RiskOverview", "DashboardRepository", "MarketTape", "health_status",
-           "risk_overview", "feed_view", "open_interest", "fmt_usd", "fmt_short"]
+           "risk_overview", "feed_view", "open_interest", "liquidation_map", "fmt_usd", "fmt_short"]
 
 HEALTH_WARNING = 1.2   # alerta temprana: < 20 % de colchón sobre el margen de mantenimiento
 
@@ -52,7 +52,7 @@ class FundOverview:
 
 @dataclass(frozen=True)
 class RiskOverview:
-    """Métricas de riesgo agregadas para los KPIs (sin Streamlit: testeable)."""
+    """Métricas de riesgo agregadas para los KPIs (sin dependencias de UI: testeable)."""
 
     open_interest: float                 # Σ |q|·mark de las cuentas activas
     fund_balance: float
@@ -100,6 +100,37 @@ def open_interest(health: AccountsHealth) -> float:
     if health.table.empty:
         return 0.0
     return float(health.table["gross_notional"].fillna(0.0).sum())
+
+
+def liquidation_map(health: AccountsHealth, *, band: float = 0.15, bins: int = 60) -> pd.DataFrame:
+    """
+    Nocional que entraría en liquidación por tramo de precio (``±band`` alrededor del mark), por activo y lado.
+
+    Usa el precio de liquidación cross-margin de cada posición (``compute_margins``, misma fórmula que el
+    motor): los largos se liquidan por debajo del mark y los cortos por encima. Devuelve una fila por
+    (activo, lado, tramo) con ``price_lo/price_hi/price_mid`` y ``notional`` (0 en tramos vacíos).
+    """
+    cols = ["symbol", "side", "price_lo", "price_hi", "price_mid", "notional", "positions", "mark"]
+    pos = health.positions
+    if pos.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for sym, grp in pos.groupby("symbol"):
+        mark = health.marks.get(sym)
+        if mark is None or not math.isfinite(mark) or mark <= 0:
+            continue
+        edges = np.linspace(mark * (1 - band), mark * (1 + band), bins + 1)
+        mids = (edges[:-1] + edges[1:]) / 2
+        for side, mask in (("Largos", grp["quantity"] > 0), ("Cortos", grp["quantity"] < 0)):
+            g = grp[mask & np.isfinite(grp["liquidation_price"])]
+            idx = np.searchsorted(edges, g["liquidation_price"].to_numpy(), side="right") - 1
+            inside = (idx >= 0) & (idx < bins)
+            notional = np.bincount(idx[inside], weights=g["notional"].to_numpy()[inside], minlength=bins)
+            count = np.bincount(idx[inside], minlength=bins)
+            rows.extend({"symbol": sym, "side": side, "price_lo": edges[i], "price_hi": edges[i + 1],
+                         "price_mid": mids[i], "notional": float(notional[i]), "positions": int(count[i]),
+                         "mark": mark} for i in range(bins))
+    return pd.DataFrame(rows, columns=cols)
 
 
 def feed_view(state: ControlState) -> pd.DataFrame:

@@ -12,7 +12,8 @@ Vistas
 * **KPIs**: Insurance Fund (alerta de déficit/ADL), cobertura sobre open interest, déficit absorbido,
   VaR/ES 99 % de la cartera agregada y liquidaciones.
 * **Gráficos**: evolución del Insurance Fund y precio simulado vs. real.
-* **Pestañas**: Cuentas y Posiciones · Liquidaciones · Insurance Fund y ADL · Feed Hyperliquid.
+* **Pestañas**: Cuentas y Posiciones · Mapa de liquidaciones · Liquidaciones · Insurance Fund y ADL ·
+  Feed Hyperliquid.
 * **Control de régimen** (lateral): Cisne Negro, Modo Normal y recapitalización de agentes con diálogo
   de confirmación, encolados en ``simulation_commands`` (plano de control en PostgreSQL).
 
@@ -51,14 +52,22 @@ if str(ROOT) not in sys.path:  # `python dashboard/app.py` desde la raíz del re
 from ai_agents.control_plane import SimulationCommand  # noqa: E402
 from dashboard import components as ui  # noqa: E402
 from dashboard import figures  # noqa: E402
-from dashboard.data import DashboardRepository, MarketTape, feed_view, fmt_usd, open_interest  # noqa: E402
+from dashboard.data import (  # noqa: E402
+    DashboardRepository,
+    MarketTape,
+    feed_view,
+    fmt_usd,
+    liquidation_map,
+    open_interest,
+)
 from dashboard.theme import GRAPH_CONFIG  # noqa: E402
 from database.connection import DatabaseManager, DBConfig  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
 FONTS = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
-TABS = ("accounts", "liquidations", "adl", "feed")
+TABS = ("accounts", "liqmap", "liquidations", "adl", "feed")
+LIQMAP_BAND = 0.15
 COMMANDS = {
     "confirm-normal": (SimulationCommand.SET_NORMAL, "Volver a Modo Normal"),
     "confirm-black-swan": (SimulationCommand.TRIGGER_BLACK_SWAN, "Cisne Negro disparado"),
@@ -205,6 +214,22 @@ def tab_view(repo: DashboardRepository, tape: MarketTape, tab: str) -> dict[str,
                 "acc-table": ui.records(health.table, ui.ACCOUNT_COLUMNS),
                 "pos-table": ui.records(health.positions, ui.POSITION_COLUMNS),
                 "acc-note": note}
+    if tab == "liqmap":
+        health = repo.accounts_health()
+        lmap = liquidation_map(health, band=LIQMAP_BAND)
+        summary = []
+        for sym, grp in lmap.groupby("symbol"):
+            for side in ("Largos", "Cortos"):
+                g = grp[(grp["side"] == side) & (grp["notional"] > 0)]
+                peak = g.loc[g["notional"].idxmax()] if len(g) else None
+                summary.append(html.Div([
+                    html.Span(f"{sym} {side.lower()}"),
+                    html.Span("—" if peak is None else
+                              f"{fmt_usd(g['notional'].sum(), compact=True)} · pico {peak['price_mid']:,.0f}"),
+                ], className="kv"))
+        if not summary:
+            summary = [html.Div("Sin posiciones abiertas.", className="text-muted-x")]
+        return {"liqmap-graph": figures.liquidation_heatmap(lmap, band=LIQMAP_BAND), "liqmap-summary": summary}
     if tab == "liquidations":
         liq = repo.liquidations()
         with_deficit = liq[liq["deficit"] > 0] if not liq.empty else liq
@@ -246,6 +271,7 @@ def tab_view(repo: DashboardRepository, tape: MarketTape, tab: str) -> dict[str,
 
 TAB_OUTPUTS = {
     "accounts": [("acc-health-graph", "figure"), ("acc-table", "data"), ("pos-table", "data"), ("acc-note", "children")],
+    "liqmap": [("liqmap-graph", "figure"), ("liqmap-summary", "children")],
     "liquidations": [("liq-stats", "children"), ("liq-deficit-graph", "figure"), ("liq-slippage-graph", "figure"),
                      ("liq-table", "data")],
     "adl": [("adl-callout", "children"), ("adl-table", "data"), ("ledger-table", "data")],
@@ -299,6 +325,7 @@ def build_layout(app: Dash, refresh_ms: int) -> html.Div:
     logo = app.get_asset_url("hyperliquid.svg")
     tabs = dbc.Tabs(id="tabs", active_tab="accounts", className="mb-3", children=[
         dbc.Tab(label="Cuentas y posiciones", tab_id="accounts"),
+        dbc.Tab(label="Mapa de liquidaciones", tab_id="liqmap"),
         dbc.Tab(label="Liquidaciones", tab_id="liquidations"),
         dbc.Tab(label="Insurance Fund · ADL", tab_id="adl"),
         dbc.Tab(label="Feed Hyperliquid", tab_id="feed"),
@@ -313,6 +340,17 @@ def build_layout(app: Dash, refresh_ms: int) -> html.Div:
             _panel("Posiciones abiertas", ui.data_table("pos-table", ui.POSITION_COLUMNS,
                                                         style_data_conditional=ui.signed_styles("quantity",
                                                                                                 "unrealized_pnl"))),
+        ],
+        "liqmap": [
+            dbc.Row([
+                dbc.Col(_panel(f"Nocional en liquidación por tramo de precio (±{LIQMAP_BAND:.0%} del mark)",
+                               _graph("liqmap-graph")), lg=9, className="mb-3"),
+                dbc.Col(_panel("Nocional a ±15 % · tramo pico", html.Div(id="liqmap-summary"),
+                               html.Div("Precio de liquidación cross-margin de cada posición abierta (misma "
+                                        "fórmula que el motor). Línea discontinua: mark actual.",
+                                        className="hint text-muted-x mt-3", style={"fontSize": "11px"})),
+                        lg=3, className="mb-3"),
+            ]),
         ],
         "liquidations": [
             dbc.Row([

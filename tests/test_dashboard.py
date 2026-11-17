@@ -21,7 +21,9 @@ import plotly.utils
 from ai_agents.control_plane import ControlPlane, ControlState, SimulationCommand
 from ai_agents.orchestrator import Orchestrator, OrchestratorConfig
 from ai_agents.trader_agents import AgentPersona, TradingAgent
-from dashboard.data import DashboardRepository, MarketTape, feed_view, fmt_usd
+import pandas as pd
+
+from dashboard.data import AccountsHealth, DashboardRepository, MarketTape, feed_view, fmt_usd, liquidation_map
 from risk_engine.liquidation_executor import LiquidationExecutor
 from tests.helpers import make_store, seed_account, seed_insurance_fund
 
@@ -195,6 +197,24 @@ def test_feed_view_and_market_tape():
     assert df["deviation_bps"].iloc[-1] == pytest.approx(-1_000.0)
 
 
+def test_liquidation_map_bins_notional_by_side():
+    positions = pd.DataFrame({
+        "user_id": [1, 2, 3, 4], "symbol": ["BTC", "BTC", "BTC", "BTC"], "quantity": [1.0, 2.0, -1.0, 1.0],
+        "liquidation_price": [90_000.0, 90_100.0, 110_000.0, 50_000.0],     # la última, fuera de ±15 %
+        "notional": [100_000.0, 200_000.0, 100_000.0, 100_000.0],
+    })
+    health = AccountsHealth(pd.DataFrame(), {"BTC": 100_000.0}, "orchestrator", True, positions)
+    m = liquidation_map(health, band=0.15, bins=30)                      # tramos de 1 000 USD
+    assert len(m) == 60 and set(m["side"]) == {"Largos", "Cortos"}
+    longs, shorts = m[m["side"] == "Largos"], m[m["side"] == "Cortos"]
+    peak = longs.loc[longs["notional"].idxmax()]
+    assert peak["price_lo"] == pytest.approx(90_000) and peak["notional"] == pytest.approx(300_000)
+    assert peak["positions"] == 2 and longs["notional"].sum() == pytest.approx(300_000)
+    assert shorts["notional"].sum() == pytest.approx(100_000)
+    assert shorts.loc[shorts["notional"].idxmax(), "price_lo"] == pytest.approx(110_000)
+    assert liquidation_map(AccountsHealth(pd.DataFrame(), {}, "none", False)).empty
+
+
 # ============================================================================= app Dash
 @pytest.fixture
 def app_env(clean_db, monkeypatch):
@@ -308,6 +328,10 @@ def test_dash_tabs_and_adl_events(app_env):
     assert [r["agent_name"] for r in acc["acc-table"]] == ["arb"]
     assert acc["pos-table"][0]["symbol"] == "BTC" and acc["pos-table"][0]["mark_price"] == 85_500.0
     assert tab_view(repo, tape, "adl")["adl-table"][0]["shortfall"] == pytest.approx(360)
+    liqmap = tab_view(repo, tape, "liqmap")
+    # arb (3x, 100k de colateral) no tiene precio de liquidación a ±15 %: estado vacío explícito
+    assert not liqmap["liqmap-graph"].data and "±15%" in _dumps(liqmap["liqmap-graph"])
+    assert "BTC largos" in _dumps(liqmap["liqmap-summary"])
     assert tab_view(repo, tape, "liquidations")["liq-table"][0]["deficit"] == pytest.approx(1_360)
 
 
