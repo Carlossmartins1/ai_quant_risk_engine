@@ -4,12 +4,12 @@
 
 ![Python](https://img.shields.io/badge/python-3.12-3776ab?logo=python&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-336791?logo=postgresql&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-135%20passing-0ca30c)
+![Tests](https://img.shields.io/badge/tests-138%20passing-0ca30c)
 ![Docker](https://img.shields.io/badge/deploy-Docker%20%C2%B7%20AWS%20EC2-2496ed?logo=docker&logoColor=white)
 
 ![Dashboard demo](RESULTADOS/demo_dashboard.gif)
 
-<sub>Full recording: [`RESULTADOS/demo_dashboard.mp4`](RESULTADOS/demo_dashboard.mp4) · [`.webm`](RESULTADOS/demo_dashboard.webm). The UI and code comments are in Spanish.</sub>
+<sub>Full recording: [`RESULTADOS/demo_dashboard.mp4`](RESULTADOS/demo_dashboard.mp4) · [`.webm`](RESULTADOS/demo_dashboard.webm). Captured with the first (Streamlit) version of the dashboard; the UI and code comments are in Spanish.</sub>
 
 ---
 
@@ -20,8 +20,8 @@
 | **Problem** | A perpetuals exchange must decide within milliseconds which accounts to liquidate, close them without ever leaving the system in a half-applied state, and absorb the bad debt when price gaps through the bankruptcy price. When the Insurance Fund is not enough, someone has to pay. |
 | **What it does** | Computes cross-margin for every account in a single NumPy pass, liquidates each account in **one ACID transaction**, collects fees or absorbs deficits in an **Insurance Fund backed by an immutable ledger** and, if the fund goes negative, runs a **pro-rata ADL** against winning positions. |
 | **How it is tested** | Three agents (LLM with structured output, or a deterministic policy) trade against a **shadow market** that mirrors Hyperliquid's L2 book. A Monte Carlo **Black Swan** (jump diffusion + Hawkes intensity + liquidity collapse) triggers the cascade. |
-| **What you see** | A real-time Streamlit dashboard: Insurance Fund, fund/Open Interest coverage, 99% VaR/ES, per-account health ratio, liquidations with slippage and the ADL history. |
-| **Engineering quality** | 135 tests (unit + integration against a real PostgreSQL + the Streamlit app via `AppTest`), checksummed migrations, append-only audit trail exported to S3, EC2 deployment with no inbound ports. |
+| **What you see** | A real-time risk terminal built with Plotly Dash: Insurance Fund, fund/Open Interest coverage, 99% VaR/ES, per-account health ratio, liquidations with slippage and the ADL history. |
+| **Engineering quality** | 138 tests (unit + integration against a real PostgreSQL + the Dash app), checksummed migrations, append-only audit trail exported to S3, EC2 deployment with no inbound ports. |
 
 ---
 
@@ -50,7 +50,7 @@ flowchart LR
     end
 
     DB[("PostgreSQL 15<br/>accounts · positions<br/>Insurance Fund + ledger<br/>append-only audit<br/>control plane")]
-    DASH["Streamlit dashboard<br/>KPIs · VaR/ES · ADL"]
+    DASH["Risk terminal (Plotly Dash)<br/>KPIs · VaR/ES · ADL"]
     S3[("S3 · SSE-KMS<br/>logs + audit")]
 
     WS --> STORE --> RECON --> SHADOW
@@ -204,7 +204,7 @@ python -m database.migrate                             # idempotent
 python -m ai_agents.orchestrator --insurance-fund 100000 --black-swan-at 60
 
 # Terminal 2 · dashboard → http://localhost:8501
-streamlit run dashboard/app.py
+python -m dashboard.app
 ```
 
 With `OPENAI_API_KEY` set, agents decide through an LLM (Pydantic structured output); if the provider fails three times in a row, a circuit breaker switches them to rules for 60 s. `--live` uses live Hyperliquid Testnet prices; `--crash-steps 1` reproduces an instantaneous gap.
@@ -224,14 +224,16 @@ Production on AWS (EC2 with no inbound ports, SSM access, secrets in Parameter S
 
 ```bash
 pip install -r requirements-dev.txt
-TEST_POSTGRES_HOST=127.0.0.1 TEST_POSTGRES_PASSWORD=… pytest      # 135 tests; integration tests are skipped without PostgreSQL
+TEST_POSTGRES_HOST=127.0.0.1 TEST_POSTGRES_PASSWORD=… pytest      # 138 tests; integration tests are skipped without PostgreSQL
 ```
 
-They cover the maths (margin, VaR/ES, GARCH, Monte Carlo, ADL), real concurrency against PostgreSQL (locks, `SKIP LOCKED`, exactly-once command queue, append-only triggers), the end-to-end simulation and the Streamlit app.
+They cover the maths (margin, VaR/ES, GARCH, Monte Carlo, ADL), real concurrency against PostgreSQL (locks, `SKIP LOCKED`, exactly-once command queue, append-only triggers), the end-to-end simulation and the Dash app.
 
 ---
 
 ## Results
+
+<sub>Screenshots from the first (Streamlit) version of the dashboard, before the migration to the Plotly Dash risk terminal.</sub>
 
 | | |
 |---|---|
